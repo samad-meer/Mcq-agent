@@ -25,13 +25,17 @@ import pyautogui
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ValidationError, model_validator
 
+pyautogui.PAUSE = 0.02  # the default 0.1 s after every move and click adds up; the agent paces itself
+
 MAX_LONG_EDGE = 1920  # larger screens are downscaled to this before sending
 GRID = 1000  # positions run 0-1000 across the screenshot, so they survive any resizing the provider does
 MAX_ATTEMPTS = 2  # clicks on one question before giving up on it
 MAX_STUCK = 2  # reads in a row asking for the same action on the same questions before stopping
 MAX_READ_TRIES = 4  # models can return bad JSON or leave a visible question unanswered
 MAX_API_RETRIES = 5  # rate limits are tight on free plans
-WAIT_SECONDS = 1.5  # time for the page to react to a click
+WAIT_SECONDS = 1.5  # before the first read: time for a hover highlight to fade once the mouse has moved away
+CLICK_SETTLE = 0.3  # after answer clicks; the move away from the option already gives the page about a second
+PAGE_SETTLE = 1.0  # after Next, Submit or a scroll, before the page is read again
 PRESS_SECONDS = (0.05, 0.2)  # range for the pause between arriving on a target and pressing
 DWELL_SECONDS = (0.2, 0.6)  # range for the pause on a target after pressing, before moving on
 POINT_SECONDS = 1.0  # how long the mouse rests on each answer during a dry run
@@ -595,7 +599,7 @@ def run(client, provider, sct, monitor, max_steps):
                 if attempts[key] == 0:
                     answered += 1
                 attempts[key] += 1
-            time.sleep(WAIT_SECONDS)
+            time.sleep(CLICK_SETTLE)
             continue
 
         cut_off = [q for q in read.questions if q.cut_off]
@@ -608,7 +612,7 @@ def run(client, provider, sct, monitor, max_steps):
                                 "Zoom the browser out (Ctrl and minus) and run again.")
             print(f"\nScrolling to see the rest of: {question.text}")
             scroll_page(monitor, amount=fit_scroll(question.position, monitor) if fits[key] == 1 else FIT_STEP)
-            time.sleep(WAIT_SECONDS)
+            time.sleep(PAGE_SETTLE)
             continue
 
         seen = [key_of(q, decided, submitted) for q in read.questions]
@@ -643,7 +647,7 @@ def run(client, provider, sct, monitor, max_steps):
             click(navigation.position, monitor)  # the page is about to change, so its blank spot is not used
         elif action == "scroll":
             scroll_page(monitor)
-        time.sleep(WAIT_SECONDS)
+        time.sleep(PAGE_SETTLE)
     else:
         print(f"\nStopped after {max_steps} steps.")
 

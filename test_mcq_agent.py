@@ -243,6 +243,17 @@ class RunLoopTest(unittest.TestCase):
             mock.call.glide(REST_X, 250, MONITOR, pace=1.3),
         ])
 
+    def test_short_settle_after_an_answer_click_and_a_longer_one_after_next(self):
+        self.play([
+            next_screen(question("Q1")),
+            next_screen(question("Q1", selected=["B"])),
+            screen(action="finish"),
+        ])
+        sleeps = [c.args[0] for c in self.calls.sleep.call_args_list]
+        self.assertEqual(sleeps, [
+            mcq_agent.WAIT_SECONDS, PRESS, DWELL, mcq_agent.CLICK_SETTLE, PRESS, DWELL, mcq_agent.PAGE_SETTLE,
+        ])
+
     def test_mouse_rests_on_the_blank_spot_the_model_found_but_not_after_moving_on(self):
         self.play([
             screen(question("Q1"), action="none", blank=Point(x=800, y=700)),
