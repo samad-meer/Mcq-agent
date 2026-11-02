@@ -43,6 +43,7 @@ POLL_SECONDS = 0.15  # between screenshots while waiting for the page to settle 
 CHANGE_SHARE = 0.001  # share of the screen that has to differ clearly before the page counts as changed
 CLICK_CHANGE = 0.01  # share of the patch around a click that has to differ before the click counts as registered
 PATCH = 60  # px across the patch compared before and after a click
+BAND = 900  # px across the strip around a clicked option that may change with it: a card shows its state along its row
 PRESS_SECONDS = (0.05, 0.2)  # range for the pause between arriving on a target and pressing
 DWELL_SECONDS = (0.2, 0.6)  # range for the pause on a target after pressing, before moving on
 POINT_SECONDS = 1.0  # how long the mouse rests on each answer during a dry run
@@ -363,6 +364,46 @@ def differs(before, after, share):
     """True when more than this share of the pixels changed clearly between two images of the same size."""
     changed = ImageChops.difference(before.convert("L"), after.convert("L")).point(CLEAR)
     return changed.histogram()[255] > share * changed.width * changed.height
+
+
+def band_box(image, point, monitor):
+    """The strip of a screenshot across the option or control at this point, clipped to the image."""
+    scale = image.width / monitor["width"]  # the screenshot may be downscaled
+    x, y = point.x / GRID * image.width, point.y / GRID * image.height
+    half_width, half_height = BAND / 2 * scale, PATCH / 2 * scale
+    return (max(0, round(x - half_width)), max(0, round(y - half_height)),
+            min(image.width, round(x + half_width)), min(image.height, round(y + half_height)))
+
+
+def changed_elsewhere(before, after, points, control, monitor):
+    """True when the page changed beyond the clicked options and the navigation control.
+
+    Feedback that appears, a page that moves on by itself or a layout that shifts all mean
+    the control the model saw may no longer be where it was, so the page has to be read
+    again. The options' own rows and the control's own box may change: that is the click
+    registering, and a Next button becoming enabled.
+    """
+    masked = after.copy()
+    for point in [*points, *([control] if control else [])]:
+        box = band_box(before, point, monitor)
+        masked.paste(before.crop(box), box)
+    return differs(before, masked, CHANGE_SHARE)
+
+
+def reusable(read):
+    """Whether this read's navigation can be followed right after confirmed answer clicks, without a second read.
+
+    Next needs a label that says so and a page that is not the last one, where Next and
+    Submit are easiest to confuse; a Submit needs the usual safety checks; a scroll is
+    always fine. Anything else gets a fresh read, as before.
+    """
+    navigation = read.navigation
+    action = intended_action(navigation)
+    if action == "next":
+        return navigation.position is not None and bool(NEXT_WORDS.search(navigation.label)) and navigation.remaining != "last"
+    if action == "submit":
+        return navigation.position is not None and submit_is_safe(read)
+    return action == "scroll"
 
 
 def row_profile(image):
@@ -738,13 +779,16 @@ def dry_run(client, provider, sct, monitor):
         print("The mouse is resting on the last answer.")
 
 
-def run(client, provider, sct, monitor, max_steps, debug=False):
+def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
     """Work through the quiz, one fresh screenshot per action.
 
     Nothing acts on a stale screen: before anything is clicked, the screen is compared
     with the one the model read, so pages that advance on their own, or that only show
     Next after an answer is picked, need no special handling. Whether a click registered
     is checked on the pixels around it, because models misread which option is marked.
+    Once every click on a page is confirmed that way and nothing else on the page moved,
+    the Next, Submit or scroll the model already found is followed without reading the
+    page again; `careful` asks for that second read every time.
     """
     decided = {}
     attempts = Counter()
@@ -797,10 +841,12 @@ def run(client, provider, sct, monitor, max_steps, debug=False):
         if any(attempts[key] for key in keys - {key_of(q, decided, done) for q, _ in pending} - given_up):
             failed = 0  # a click made earlier shows as registered now
         clicked = []
+        gave_up = False
         for question, options in pending:
             key = key_of(question, decided, done)
             if attempts[key] >= MAX_ATTEMPTS:
                 given_up.add(key)
+                gave_up = True
                 answered -= 1
                 failed += 1
                 print(f"\nCould not select the answer to: {question.text}\n   Moving on; please answer this one yourself.")
@@ -817,13 +863,22 @@ def run(client, provider, sct, monitor, max_steps, debug=False):
             attempts[key] += 1
         if clicked:
             time.sleep(CLICK_SETTLE)
+            confirmed = False
             if fresh is not None:
                 after = capture(sct, monitor)
                 for key, option, before in clicked:
                     if differs(before, patch(after, option.position, monitor), CLICK_CHANGE):
                         verified.setdefault(key, set()).add(option.label)
                         failed = 0
-            continue
+                # Every click took and nothing else on the page moved, so the control the model
+                # found is still where it was: no need to read the page again before following it.
+                confirmed = (not careful and not gave_up and reusable(read)
+                             and all(option.label in verified.get(key, ()) for key, option, _ in clicked)
+                             and not changed_elsewhere(fresh, after, [option.position for _, option, _ in clicked],
+                                                       navigation.position, monitor))
+            if not confirmed:
+                continue
+            fresh = after
 
         cut_off = [q for q in read.questions if q.cut_off]
         if cut_off:
@@ -897,6 +952,8 @@ def main():
                         help="how much the model thinks before answering; less is faster and cheaper (gemini only)")
     parser.add_argument("--debug", action="store_true",
                         help=f"save every screenshot read, with the click targets drawn, in the {DEBUG_FOLDER} folder")
+    parser.add_argument("--careful", action="store_true",
+                        help="read the screen again after every answer click before moving on: slower, safest on a new site")
     args = parser.parse_args()
 
     provider = dict(PROVIDERS[args.provider])
@@ -918,7 +975,7 @@ def main():
             if args.dry_run:
                 dry_run(client, provider, sct, monitor)
             else:
-                run(client, provider, sct, monitor, args.max_steps, args.debug)
+                run(client, provider, sct, monitor, args.max_steps, args.debug, args.careful)
     except AgentStop as e:
         sys.exit(f"\nStopped: {e}")
     except pyautogui.FailSafeException:

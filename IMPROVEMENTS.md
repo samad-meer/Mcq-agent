@@ -27,7 +27,9 @@ Night of 2 November, after the W3Schools-style run (every scroll "measured 0 px"
 - Scrolling, after an adversarial review: never more than 2 notches per wheel event, stop short of the target instead of past it (`SCROLL_TOLERANCE = 1.0`), "did not move" only when the two screenshots are byte-identical, fixed headers and footers left out of the measurement, measurements scaled on downscaled captures, and a move that lines up equally well at two shifts counted as unclear.
 - `--debug` saves every read as `reads\read-NNN.jpg` with the targets drawn, so a bad run can be examined afterwards.
 
-Still to do: the one-read-per-question part of change 1, changes 3, 5 and 8, and the adaptive wait after answer clicks.
+3 November 2026: the one-read-per-question part of change 1 is in. Once every answer click on a page is confirmed on the pixels and nothing else on the page changed (`changed_elsewhere`, which ignores the clicked options' rows and the control's own box), the agent follows the Next, Submit or scroll from the same read (`reusable`): a Next needs a clear label and not the last page, a Submit the usual safety checks. `--careful` keeps the second read.
+
+Still to do: changes 3, 5 and 8, `answers.md`, and the adaptive wait after answer clicks (still the fixed 0.3 s plus the pixel check).
 
 ## 1. Where the time goes now
 
@@ -276,8 +278,8 @@ New tests to add: a verified click leads straight to Next with no second read; a
 1. Done: the timing line, `--effort` and the warm-up (changes 7 and 2). The next real run shows where the time really goes.
 2. Done: the interim sleeps and `pyautogui.PAUSE` (change 4's quick part).
 3. Done: the `cut_off` flag and the computed scroll, so tall questions are read whole.
-4. `wait_until_still` with its floor and cap, then change 1 with `--careful`, then change 8's `--quick` and the firmer `blank` request. This is the main work.
+4. Done: change 1 with `--careful`, and the wait after Next and Submit is adaptive. Left from here: change 8's `--quick` and the firmer `blank` request.
 5. Change 3 (shorter option texts only) and change 5's JPEG setting. `--region` only if you want privacy or larger text.
-6. `answers.md`, `--debug`, and skip instead of stop.
+6. `answers.md` (`--debug` and skip instead of stop are done).
 
 Then measure on `demo_quiz.html` and on one ProProfs quiz: seconds per question, model calls per question, right answers, and wrong or missed clicks. Keep `gemini-3.5-flash-lite` for speed. The research report's pick for accuracy is `gemini-3.8-flash`, but on the free tier an earlier test measured about 129 s per read and hit the daily limit after about 20 calls, so it needs a paid key before it is usable here. Everything above works with both.

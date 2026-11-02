@@ -336,11 +336,15 @@ class FakeQuiz:
 
     registers=False makes clicks on options change nothing, as a click that misses does;
     advances=False makes Next change nothing. The page also changes by itself on the
-    screenshots numbered in drift_at, or on every screenshot when restless.
+    screenshots numbered in drift_at, or on every screenshot when restless. feedback=True
+    shows a box under the options after an answer click, as a quiz that marks the answer
+    at once does.
     """
 
-    def __init__(self, registers=True, advances=True, drift_at=(), restless=False):
+    def __init__(self, registers=True, advances=True, drift_at=(), restless=False, feedback=False):
         self.registers, self.advances, self.drift_at, self.restless = registers, advances, drift_at, restless
+        self.feedback = feedback
+        self.feedback_shown = False
         self.marks = []
         self.page = 0
         self.shots = 0
@@ -354,6 +358,8 @@ class FakeQuiz:
         draw.rectangle((50, 50, 950, 60 + 5 * self.page), fill="black")  # a block that grows with every page
         for x, y in self.marks:
             draw.rectangle((x - 10, y - 10, x + 10, y + 10), fill="black")
+        if self.feedback_shown:
+            draw.rectangle((50, 800, 950, 900), fill="black")
         return image
 
     def click(self, x, y):
@@ -361,23 +367,26 @@ class FakeQuiz:
             if self.advances:
                 self.page += 1
                 self.marks = []
+                self.feedback_shown = False
         elif self.registers:
             self.marks.append((x, y))
+            self.feedback_shown = self.feedback
 
 
 class RunLoopTest(unittest.TestCase):
     """Drives run() with scripted screens, recording clicks instead of performing them."""
 
-    def play(self, reads, max_steps=20, quiz=None):
+    def play(self, reads, max_steps=20, quiz=None, careful=False):
         """Returns the click positions and scroll count; self.calls keeps every screen and mouse call in order.
 
-        With a FakeQuiz the screenshots come from it and the clicks land on it; without one there are none.
+        With a FakeQuiz the screenshots come from it and the clicks land on it; without one there
+        are none, so no click can be confirmed and every page is read twice. self.reads counts the reads.
         """
         reads = iter(reads)
         self.calls = mock.Mock()
         with (
             mock.patch.object(mcq_agent, "capture", side_effect=quiz.image if quiz else lambda *_: None) as capture,
-            mock.patch.object(mcq_agent, "read_screen", side_effect=lambda *_: next(reads)),
+            mock.patch.object(mcq_agent, "read_screen", side_effect=lambda *_: next(reads)) as read,
             mock.patch.object(mcq_agent, "wobble", STILL),
             mock.patch.dict(mcq_agent.learned, {"per_notch": None}),
             mock.patch.object(mcq_agent, "glide") as glide,
@@ -388,8 +397,9 @@ class RunLoopTest(unittest.TestCase):
         ):
             for name, child in [("capture", capture), ("sleep", sleep), ("glide", glide), ("click", click), ("scroll", scroll)]:
                 self.calls.attach_mock(child, name)
-            mcq_agent.run(None, None, None, MONITOR, max_steps)
+            mcq_agent.run(None, None, None, MONITOR, max_steps, careful=careful)
         self.printed = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.reads = read.call_count
         return [c.args for c in click.call_args_list], scroll.call_count
 
     def test_first_read_waits_for_the_mouse_to_rest_away_from_the_options(self):
@@ -663,9 +673,74 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(self.printed.count("Moving on"), 2)
 
     def test_a_click_the_pixels_confirm_is_not_repeated_when_the_model_sees_no_mark(self):
-        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")], quiz=FakeQuiz())
+        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")],
+                              quiz=FakeQuiz(), careful=True)
         self.assertEqual(clicks, [(100, 250), (700, 600)])
         self.assertNotIn("Moving on", self.printed)
+
+    def test_confirmed_clicks_go_straight_to_next_without_a_second_read(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1")),
+            next_screen(question("Q2", answers=["A"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (700, 600), (100, 200), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_careful_reads_the_page_again_after_every_answer(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1")),
+            next_screen(question("Q1", selected=["B"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz(), careful=True)
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_next_without_a_clear_label_gets_a_second_read(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1"), label=""),
+            next_screen(question("Q1", selected=["B"]), label=""),
+            screen(action="finish"),
+        ], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_the_last_question_gets_a_second_read_before_next(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1"), remaining="last"),
+            next_screen(question("Q1", selected=["B"]), remaining="last"),
+            screen(action="finish"),
+        ], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_a_page_that_shows_feedback_after_the_click_is_read_again(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1")),
+            next_screen(question("Q1", selected=["B"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz(feedback=True))
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_a_safe_submit_is_clicked_right_after_a_confirmed_answer(self):
+        clicks, _ = self.play([
+            submit_screen(question("Q1")),
+            next_screen(question("Q1", selected=["B"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (500, 600), (700, 600)])
+        self.assertEqual(self.reads, 3)
+
+    def test_a_scroll_follows_confirmed_clicks_without_a_second_read(self):
+        clicks, scrolls = self.play([
+            screen(question("Q1"), action="scroll"),
+            screen(question("Q2", answers=["A"]), action="finish"),
+            screen(question("Q2", answers=["A"], selected=["A"]), action="finish"),
+        ], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (100, 200)])
+        self.assertEqual(scrolls, 1)
+        self.assertEqual(self.reads, 3)
 
     def test_a_click_that_changed_nothing_is_tried_once_more_then_the_question_is_left(self):
         clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [
@@ -677,7 +752,7 @@ class RunLoopTest(unittest.TestCase):
         self.assertIn("Moving on", self.printed)
 
     def test_waits_for_the_page_to_change_after_next_instead_of_a_fixed_pause(self):
-        self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")], quiz=FakeQuiz())
+        self.play([next_screen(question("Q1")), screen(action="finish")], quiz=FakeQuiz())
         sleeps = [c.args[0] for c in self.calls.sleep.call_args_list]
         self.assertNotIn(mcq_agent.PAGE_SETTLE, sleeps)
         self.assertLess(sleeps.count(mcq_agent.POLL_SECONDS), 6)  # one poll sees the change, two more see it hold still
@@ -689,7 +764,7 @@ class RunLoopTest(unittest.TestCase):
         self.assertGreaterEqual(sleeps.count(mcq_agent.POLL_SECONDS), 2 * round(mcq_agent.CHANGE_TIMEOUT / mcq_agent.POLL_SECONDS))
 
     def test_a_page_that_changed_during_the_read_is_read_again_before_anything_is_clicked(self):
-        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [screen(action="finish")], quiz=FakeQuiz(drift_at={2}))
+        clicks, _ = self.play([next_screen(question("Q1"))] * 2 + [screen(action="finish")], quiz=FakeQuiz(drift_at={2}))
         self.assertEqual(clicks, [(100, 250), (700, 600)])
         self.assertEqual(self.printed.count("changed while I was reading"), 1)
 
@@ -765,6 +840,25 @@ class RunLoopTest(unittest.TestCase):
         ])
         self.assertEqual(clicks, [(100, 250), (100, 300)])
         self.assertEqual(scrolls, 1)
+
+
+class ChangedElsewhereTest(unittest.TestCase):
+    def shot(self, marks=(), size=10):
+        image = Image.new("RGB", (MONITOR["width"], MONITOR["height"]), "white")
+        draw = ImageDraw.Draw(image)
+        for x, y in marks:
+            draw.rectangle((x - size, y - size, x + size, y + size), fill="black")
+        return image
+
+    def test_a_change_on_the_clicked_option_row_or_the_control_is_expected(self):
+        before, option = self.shot(), Point(x=100, y=250)
+        self.assertFalse(mcq_agent.changed_elsewhere(before, self.shot([(100, 250), (700, 600)], size=25), [option], NEXT, MONITOR))
+        self.assertFalse(mcq_agent.changed_elsewhere(before, self.shot([(500, 250)], size=25), [option], NEXT, MONITOR))  # a tick at the row's far end
+
+    def test_a_change_anywhere_else_means_the_page_reacted(self):
+        before, option = self.shot(), Point(x=100, y=250)
+        self.assertTrue(mcq_agent.changed_elsewhere(before, self.shot([(100, 250), (500, 800)], size=40), [option], NEXT, MONITOR))
+        self.assertTrue(mcq_agent.changed_elsewhere(before, self.shot([(700, 600)], size=40), [option], None, MONITOR))  # no control to excuse it
 
 
 class PrintTest(unittest.TestCase):

@@ -65,6 +65,7 @@ ollama pull gemma3:4b
 - Other options pass through, for example `run.bat --model gemini-3.8-flash` for harder questions. That model is much slower on the free tier.
 - `run.bat --effort low` makes Gemini think less, which is faster and cheaper (`none`, `low`, `medium` or `high`). Look at the thinking tokens it prints first: if they are already 0, this changes nothing. Check the right-answer count on a known quiz before relying on it.
 - `run.bat --debug` saves every screenshot it read, with red circles on the click targets, as `reads\read-001.jpg`, `read-002.jpg` and so on. When a run goes wrong, these show what the agent saw at each step.
+- `run.bat --careful` reads the screen again after every answer before moving on, as earlier versions did. Slower, but the safest choice the first time on a new site.
 
 ## Try it on the demo quiz
 
@@ -90,7 +91,8 @@ The demo quiz shows your score after you press Submit.
 2. The model reads it and returns each question, the correct option, what is already selected, and where to click. A question whose options run below the bottom of the screen is reported as cut off.
 3. Before clicking anything, take another screenshot and compare it with the one the model read. If the page changed in the meantime (some quizzes move on by themselves), read it again instead of clicking a page that is no longer there.
 4. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option and compare the pixels around the click before and after: if they changed, the click registered, whatever the next read says about which option looks selected. A question the model reports as already selected on first sight is clicked anyway when it has one answer, because a hover highlight or a misread looks the same and clicking a chosen option again changes nothing.
-5. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) before reading it, so a slow page is not mistaken for a Next button that did nothing.
+5. If every click on the page registered and nothing else on the page changed, it moves on at once with the Next, Submit or scroll the model already found, so most questions need one model call. It reads the page again first when a click could not be confirmed, when the page reacted to the click (feedback appeared), when Next has no clear label, on the last question, or always with `--careful`.
+6. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) before reading it, so a slow page is not mistaken for a Next button that did nothing.
 
 ## When it stops
 
@@ -106,7 +108,7 @@ The demo quiz shows your score after you press Submit.
 - Keep the quiz visible and don't touch the mouse while it runs. Moving it during a click shifts where the click lands.
 - It only reads your main monitor.
 - Answers can be wrong, especially on image-heavy or very specialized questions.
-- Each question uses at least two model calls. Every call prints its time and token counts, with the thinking tokens when the provider reports them.
+- Most questions use one model call; a second one is made when a click cannot be confirmed or the page needs another look (see "How it works"). Every call prints its time and token counts, with the thinking tokens when the provider reports them.
 
 ## Tests
 
