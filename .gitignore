@@ -1,0 +1,8 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Agent output: screenshots of this computer's screen and saved reads
+last_read.jpg
+reads/

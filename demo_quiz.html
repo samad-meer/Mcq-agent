@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Demo Quiz</title>
+<style>
+  body { font: 18px system-ui, sans-serif; background: #f4f4f6; color: #1a1a1f; margin: 0; }
+  main { max-width: 640px; margin: 48px auto; padding: 32px; background: #fff; border-radius: 12px; }
+  h1 { font-size: 16px; font-weight: 600; color: #666; margin: 0 0 16px; }
+  p { font-size: 22px; margin: 0 0 24px; }
+  label { display: block; padding: 12px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 8px; cursor: pointer; }
+  button { margin-top: 16px; padding: 12px 28px; font-size: 18px; border: 0; border-radius: 8px; background: #2d5be3; color: #fff; cursor: pointer; }
+  button:disabled { background: #bbb; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<main id="quiz"></main>
+<script>
+const questions = [
+  { text: "What is the capital of Japan?", options: ["Seoul", "Tokyo", "Beijing", "Bangkok"], answer: [1] },
+  { text: "Which planet is known as the Red Planet?", options: ["Venus", "Jupiter", "Mars", "Saturn"], answer: [2] },
+  { text: "Select all the prime numbers.", options: ["2", "4", "7", "9"], answer: [0, 2], multiple: true },
+  { text: "What is the chemical symbol for sodium?", options: ["So", "Sd", "S", "Na"], answer: [3] },
+  { text: "How many sides does a hexagon have?", options: ["5", "6", "7", "8"], answer: [1] },
+];
+const picked = questions.map(() => []);
+let index = 0;
+const quiz = document.getElementById("quiz");
+
+function render() {
+  const q = questions[index];
+  const type = q.multiple ? "checkbox" : "radio";
+  quiz.innerHTML = `
+    <h1>Question ${index + 1} of ${questions.length}</h1>
+    <p>${q.text}</p>
+    ${q.options.map((o, i) => `<label><input type="${type}" name="o" value="${i}"> ${o}</label>`).join("")}
+    <button id="go" disabled>${index === questions.length - 1 ? "Submit" : "Next"}</button>`;
+  const go = document.getElementById("go");
+  quiz.querySelectorAll("input").forEach(input => input.addEventListener("change", () => {
+    picked[index] = [...quiz.querySelectorAll("input:checked")].map(i => Number(i.value));
+    go.disabled = picked[index].length === 0;
+  }));
+  go.addEventListener("click", () => {
+    index += 1;
+    index < questions.length ? render() : showScore();
+  });
+}
+
+function showScore() {
+  const correct = questions.filter((q, i) => [...picked[i]].sort().join() === q.answer.join()).length;
+  quiz.innerHTML = `<h1>Done</h1><p>You scored ${correct} of ${questions.length}.</p>`;
+}
+
+render();
+</script>
+</body>
+</html>
