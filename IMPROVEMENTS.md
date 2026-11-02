@@ -15,7 +15,19 @@ Done on 2 November 2026:
 
 Also done on 2 November 2026, as the first step of the order of work: the timing line on every model call, `--effort` (Gemini only) and the connection warm-up during the countdown (changes 2 and 7). Then the second step: `pyautogui.PAUSE = 0.02`, and the fixed sleeps cut to 0.3 s after an answer click and 1.0 s after Next, Submit or a scroll (the quick part of change 4). Section 1 below describes the loop before these two steps; take about 2 s per question off its figures.
 
-Still to do: changes 1, 3, 4 (the adaptive wait), 5 and 8, and the rest of section 4.
+Later on 2 November: scrolling measures how far the page really moved between two screenshots and corrects itself ([scroll_page](mcq_agent.py), [measure_shift](mcq_agent.py)), instead of assuming 100 px per notch. On this 150 % display a notch moves about 150 px, which is why the fit scroll overshot and the agent scrolled up and down. A cut-off question is scrolled once; if it still does not fit, the agent asks for a zoom-out. `FIT_STEP`, `MAX_FITS = 2` and `SCROLL_AMOUNT` are gone, and the settle wait after a scroll is now adaptive (two matching screenshots in a row), which is part of change 4.
+
+Night of 2 November, after the W3Schools-style run (every scroll "measured 0 px", a skipped question, a run ended by "Clicks are not registering"):
+
+- The local click check from change 1 is in: [run](mcq_agent.py) compares a 60×60 px patch around each click before and after it ([patch](mcq_agent.py), [differs](mcq_agent.py)); a click the pixels confirm is never repeated, whatever the next read says about `selected`. The second read per question is still made, so the time saving of change 1 is not taken yet.
+- A question whose clicks never register is left for you after 2 tries ("Could not select the answer to: ..."); the run stops only after two such questions in a row (`MAX_FAILED`).
+- Before acting on a read, the screen is captured again and compared with the one the model saw; a page that changed meanwhile is read again (`MAX_STALE = 2`), which is the "stale screen" risk from change 1 handled generally.
+- After Next or Submit the agent waits for the page to really change, up to 3 s, then for it to hold still ([wait_for_change](mcq_agent.py)); this is the adaptive wait after Next from change 4. The wait after answer clicks is still the fixed 0.3 s plus the pixel check.
+- A single-answer question the model reports as already selected on first sight is clicked anyway (hover highlight or misread look the same), which is the other half of the hover fix from section 4.
+- Scrolling, after an adversarial review: never more than 2 notches per wheel event, stop short of the target instead of past it (`SCROLL_TOLERANCE = 1.0`), "did not move" only when the two screenshots are byte-identical, fixed headers and footers left out of the measurement, measurements scaled on downscaled captures, and a move that lines up equally well at two shifts counted as unclear.
+- `--debug` saves every read as `reads\read-NNN.jpg` with the targets drawn, so a bad run can be examined afterwards.
+
+Still to do: the one-read-per-question part of change 1, changes 3, 5 and 8, and the adaptive wait after answer clicks.
 
 ## 1. Where the time goes now
 

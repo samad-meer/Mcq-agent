@@ -22,7 +22,16 @@ Use `--model` to pick any other vision model from the same provider:
 .venv\Scripts\python mcq_agent.py --provider local --model qwen2.5vl
 ```
 
-## Setup
+## Set up on a new PC: setup.bat
+
+Works on a Windows 10 or 11 PC with nothing installed. With the internet connected:
+
+1. Copy this folder to the PC (or download it from GitHub with Code, then Download ZIP, and unzip it).
+2. Double-click `setup.bat`. If the PC has no Python 3.13, it downloads it from python.org and installs it for your user account, which needs no admin rights. Then it installs the exact package versions in `requirements.txt`.
+3. When it asks, paste a Gemini API key. Each person needs their own free key from https://aistudio.google.com/apikey, because the free daily limit belongs to the key's project.
+4. Run `run.bat` as described below. `setup.bat` only needs to run again if a file in this folder changes.
+
+## Setup by hand
 
 ```powershell
 python -m venv .venv
@@ -55,6 +64,7 @@ ollama pull gemma3:4b
 - `run.bat --dry-run` points the mouse at the answer without clicking and prints what it would click next, such as `Navigation: submit (Submit answer)`. Use it first on a site you haven't tried before.
 - Other options pass through, for example `run.bat --model gemini-3.8-flash` for harder questions. That model is much slower on the free tier.
 - `run.bat --effort low` makes Gemini think less, which is faster and cheaper (`none`, `low`, `medium` or `high`). Look at the thinking tokens it prints first: if they are already 0, this changes nothing. Check the right-answer count on a known quiz before relying on it.
+- `run.bat --debug` saves every screenshot it read, with red circles on the click targets, as `reads\read-001.jpg`, `read-002.jpg` and so on. When a run goes wrong, these show what the agent saw at each step.
 
 ## Try it on the demo quiz
 
@@ -78,14 +88,15 @@ The demo quiz shows your score after you press Submit.
 
 1. Take a screenshot.
 2. The model reads it and returns each question, the correct option, what is already selected, and where to click. A question whose options run below the bottom of the screen is reported as cut off.
-3. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option, then take a new screenshot to confirm it registered.
-4. Submit the answer if the question has its own Submit button, then move on with Next or by scrolling, and repeat.
+3. Before clicking anything, take another screenshot and compare it with the one the model read. If the page changed in the meantime (some quizzes move on by themselves), read it again instead of clicking a page that is no longer there.
+4. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option and compare the pixels around the click before and after: if they changed, the click registered, whatever the next read says about which option looks selected. A question the model reports as already selected on first sight is clicked anyway when it has one answer, because a hover highlight or a misread looks the same and clicking a chosen option again changes nothing.
+5. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) before reading it, so a slow page is not mistaken for a Next button that did nothing.
 
 ## When it stops
 
 - **Last question:** it stops before the button that ends the whole quiz. It only clicks a Submit that records one answer: the button's own text has to say so (Submit answer, Check, Submit & Next and the like) or the model has to report that it records only the question in view. A button whose text mentions the quiz, test, exam, finish, end, results, score or similar words, in English and a few other languages, is never clicked, and neither is Previous or Back. On quizzes with a Submit button for each question, it also leaves the last one to you. This depends on the model reading the page right, so run `run.bat --dry-run` on a new site first.
-- **A click doesn't register:** it stops after 2 tries on the same question.
-- **A question doesn't fit on the screen:** after two scrolls it asks you to zoom the browser out (Ctrl and minus) and run again.
+- **A click doesn't register:** after 2 tries on the same question it prints `Could not select the answer to: ...`, leaves that question for you and moves on. It stops only when this happens on two questions in a row, which means clicks are not reaching the page at all (the quiz window is not in front, or something covers it).
+- **A question doesn't fit on the screen:** it scrolls the question's first line to the top of the page area, measuring how far the page really moves rather than assuming, never more than two wheel notches at a time, and stopping short rather than past the target. If the options are still cut off, or the page does not scroll at all, it asks you to zoom the browser out (Ctrl and minus) and run again. Every scroll prints a line such as `Scroll: asked 450 px, measured 300 px in 2 wheel event(s), 150 px per notch measured`; `the page did not move` on that line means the wheel is not scrolling this page.
 - **The screen stops changing:** this covers a Next button that does nothing, or no quiz on screen.
 - **You abort:** move the mouse to any corner of the screen.
 

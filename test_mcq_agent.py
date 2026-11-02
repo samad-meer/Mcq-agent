@@ -9,7 +9,7 @@ from unittest import mock
 
 import httpx2
 import openai
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import mcq_agent
 from mcq_agent import AgentStop, Navigation, Option, Point, Question, ScreenRead
@@ -84,54 +84,62 @@ class KeyTest(unittest.TestCase):
 
 class PendingClicksTest(unittest.TestCase):
     def test_unanswered_question_is_clicked(self):
-        pending = mcq_agent.pending_clicks(screen(question()), {}, Counter())
+        pending = mcq_agent.pending_clicks(screen(question()), {})
         self.assertEqual([o.label for o in pending[0][1]], ["B"])
 
-    def test_correctly_marked_question_is_skipped(self):
-        self.assertEqual(mcq_agent.pending_clicks(screen(question(selected=["B"])), {}, Counter()), [])
+    def test_a_mark_on_a_single_answer_question_at_first_sight_is_clicked_anyway(self):
+        pending = mcq_agent.pending_clicks(screen(question(selected=["B"])), {})
+        self.assertEqual([o.label for o in pending[0][1]], ["B"])
+
+    def test_a_mark_on_a_question_already_decided_is_trusted(self):
+        decided = {mcq_agent.question_key(question()): ["B"]}
+        self.assertEqual(mcq_agent.pending_clicks(screen(question(selected=["B"])), decided), [])
+
+    def test_a_mark_on_a_multi_answer_question_is_trusted_at_first_sight(self):
+        read = screen(question(answers=["A", "C"], selected=["A", "C"]))
+        self.assertEqual(mcq_agent.pending_clicks(read, {}), [])
 
     def test_multi_select_clicks_only_what_is_missing(self):
         read = screen(question(answers=["A", "C"], selected=["A"]))
-        pending = mcq_agent.pending_clicks(read, {}, Counter())
+        pending = mcq_agent.pending_clicks(read, {})
         self.assertEqual([o.label for o in pending[0][1]], ["C"])
+
+    def test_a_click_seen_to_register_is_not_repeated_whatever_the_model_sees(self):
+        key = mcq_agent.question_key(question())
+        self.assertEqual(mcq_agent.pending_clicks(screen(question()), {key: ["B"]}, verified={key: {"B"}}), [])
 
     def test_changed_answer_on_a_later_read_does_not_flip_selection(self):
         decided = {}
-        mcq_agent.pending_clicks(screen(question(answers=["B"])), decided, Counter())
+        mcq_agent.pending_clicks(screen(question(answers=["B"])), decided)
         read = screen(question(answers=["C"], selected=["B"]))
-        self.assertEqual(mcq_agent.pending_clicks(read, decided, Counter()), [])
+        self.assertEqual(mcq_agent.pending_clicks(read, decided), [])
 
     def test_question_text_is_matched_ignoring_case_spacing_and_punctuation(self):
         decided = {}
-        mcq_agent.pending_clicks(screen(question("Q3. What is  2 + 2?")), decided, Counter())
+        mcq_agent.pending_clicks(screen(question("Q3. What is  2 + 2?")), decided)
         read = screen(question("what is 2+2", answers=["C"], selected=["B"]))
-        self.assertEqual(mcq_agent.pending_clicks(read, decided, Counter()), [])
+        self.assertEqual(mcq_agent.pending_clicks(read, decided), [])
 
     def test_same_wording_with_other_options_is_another_question(self):
         decided = {}
-        mcq_agent.pending_clicks(screen(question("Which is true?")), decided, Counter())
+        mcq_agent.pending_clicks(screen(question("Which is true?")), decided)
         read = screen(question("Which is true?", answers=["C"], options=("x", "y", "z")))
-        pending = mcq_agent.pending_clicks(read, decided, Counter())
+        pending = mcq_agent.pending_clicks(read, decided)
         self.assertEqual([o.label for o in pending[0][1]], ["C"])
 
     def test_question_shown_twice_in_one_read_is_clicked_once(self):
-        pending = mcq_agent.pending_clicks(screen(question(), question()), {}, Counter())
+        pending = mcq_agent.pending_clicks(screen(question(), question()), {})
         self.assertEqual(len(pending), 1)
-
-    def test_stops_when_clicks_keep_failing(self):
-        attempts = Counter({mcq_agent.question_key(question()): mcq_agent.MAX_ATTEMPTS})
-        with self.assertRaises(AgentStop):
-            mcq_agent.pending_clicks(screen(question()), {}, attempts)
 
     def test_submitted_question_is_left_alone_even_with_feedback_added(self):
         submitted = {mcq_agent.question_key(question())}
         read = screen(question("What is 2 + 2? Correct, well done!"))
-        self.assertEqual(mcq_agent.pending_clicks(read, {}, Counter(), submitted), [])
+        self.assertEqual(mcq_agent.pending_clicks(read, {}, submitted), [])
 
     def test_cut_off_question_is_neither_clicked_nor_decided(self):
         decided = {}
         read = screen(question(answers=["A"], options=("3", "4"), cut_off=True))
-        self.assertEqual(mcq_agent.pending_clicks(read, decided, Counter()), [])
+        self.assertEqual(mcq_agent.pending_clicks(read, decided), [])
         self.assertEqual(decided, {})
 
 
@@ -163,15 +171,139 @@ class CoordinatesTest(unittest.TestCase):
 
 class FitScrollTest(unittest.TestCase):
     def test_brings_the_first_line_up_to_the_top_of_the_page_area(self):
-        # 400 grid rows down is 400 px on the 1001-px monitor: four notches of 100 px.
-        self.assertEqual(mcq_agent.fit_scroll(Point(x=300, y=600), MONITOR), -4 * mcq_agent.WHEEL_NOTCH)
+        # 400 grid rows down is 400 px on the 1001-px monitor.
+        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), MONITOR), 400.4, places=1)
 
     def test_scales_with_the_screen(self):
-        # The same 400 rows are 432 px on a 1080-px screen, still four notches.
-        self.assertEqual(mcq_agent.fit_scroll(Point(x=300, y=600), SCREEN), -4 * mcq_agent.WHEEL_NOTCH)
+        # The same 400 rows are 432 px on a 1080-px screen.
+        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), SCREEN), 432.0, places=1)
 
-    def test_always_scrolls_at_least_one_notch(self):
-        self.assertEqual(mcq_agent.fit_scroll(Point(x=300, y=150), MONITOR), -mcq_agent.WHEEL_NOTCH)
+    def test_a_question_already_at_the_top_has_nowhere_to_go(self):
+        self.assertLess(mcq_agent.fit_scroll(Point(x=300, y=150), MONITOR), 0)
+
+
+def fake_page(height=2400, seed=5):
+    """A tall page of horizontal bands of varied brightness, so a crop of it looks like a screenshot."""
+    page = Image.new("L", (MONITOR["width"], height), 255)
+    rng = random.Random(seed)
+    y = 0
+    while y < height:
+        band = rng.randint(12, 60)
+        page.paste(rng.randint(0, 200), (0, y, MONITOR["width"], min(height, y + band)))
+        y += band
+    return page.convert("RGB")
+
+
+class MeasureShiftTest(unittest.TestCase):
+    def setUp(self):
+        self.page = fake_page()
+
+    def screenshot(self, offset):
+        return self.page.crop((0, offset, MONITOR["width"], offset + MONITOR["height"]))
+
+    def test_finds_how_far_the_page_moved_in_either_direction(self):
+        self.assertAlmostEqual(mcq_agent.measure_shift(self.screenshot(0), self.screenshot(150)), 150, delta=4)
+        self.assertAlmostEqual(mcq_agent.measure_shift(self.screenshot(300), self.screenshot(150)), -150, delta=4)
+        self.assertAlmostEqual(mcq_agent.measure_shift(self.screenshot(100), self.screenshot(404)), 304, delta=4)
+
+    def test_a_move_too_far_to_line_up_is_unclear_not_wrong(self):
+        self.assertIsNone(mcq_agent.measure_shift(self.screenshot(100), self.screenshot(620)))
+
+    def test_an_unchanged_screen_is_unclear_rather_than_a_move(self):
+        self.assertIsNone(mcq_agent.measure_shift(self.screenshot(200), self.screenshot(200)))
+
+    def test_a_screen_that_changed_without_moving_is_unclear(self):
+        other = fake_page(seed=9)
+        self.assertIsNone(mcq_agent.measure_shift(self.screenshot(0), other.crop((0, 0, MONITOR["width"], MONITOR["height"]))))
+
+    def test_a_fixed_header_inside_the_band_does_not_hide_the_move(self):
+        before, after = self.screenshot(0), self.screenshot(150)
+        for shot in (before, after):
+            shot.paste((40, 40, 40), (0, 200, MONITOR["width"], 290))  # a dark sticky header
+        self.assertAlmostEqual(mcq_agent.measure_shift(before, after), 150, delta=4)
+
+    def test_rows_of_identical_cards_are_unclear(self):
+        page = Image.new("RGB", (MONITOR["width"], 2400), "white")
+        for y in range(0, 2400, 50):
+            page.paste((120, 120, 120), (0, y, MONITOR["width"], y + 25))
+        before = page.crop((0, 0, MONITOR["width"], MONITOR["height"]))
+        after = page.crop((0, 170, MONITOR["width"], 170 + MONITOR["height"]))
+        self.assertIsNone(mcq_agent.measure_shift(before, after))
+
+
+class ScrollPageTest(unittest.TestCase):
+    """Drives scroll_page against a fake page that moves 150 px per wheel notch, as a 150 % display does."""
+
+    def drive(self, pixels, per_notch=150, start=0, stuck_at=None, learned=None, scale=1.0):
+        """Scroll a fresh page by `pixels`; `scale` shrinks its screenshots, as capture does on a wide screen."""
+        page = fake_page()
+        offset = {"y": start}
+        self.wheel = []
+
+        def turn(amount):
+            self.wheel.append(amount)
+            target = offset["y"] - amount / mcq_agent.WHEEL_NOTCH * per_notch
+            offset["y"] = round(min(stuck_at if stuck_at is not None else target, target))
+
+        def shot(sct, monitor):
+            image = page.crop((0, offset["y"], MONITOR["width"], offset["y"] + MONITOR["height"]))
+            if scale != 1:
+                image = image.resize((round(image.width * scale), round(image.height * scale)))
+            return image
+
+        with (
+            mock.patch.dict(mcq_agent.learned, {"per_notch": learned}),
+            mock.patch.object(mcq_agent, "capture", side_effect=shot),
+            mock.patch.object(mcq_agent.pyautogui, "scroll", side_effect=turn),
+            mock.patch.object(mcq_agent, "glide"),
+            mock.patch.object(mcq_agent, "wobble", STILL),
+            mock.patch.object(mcq_agent.time, "sleep"),
+            mock.patch("builtins.print"),
+        ):
+            moved = mcq_agent.scroll_page(object(), MONITOR, pixels)
+            self.learned = mcq_agent.learned["per_notch"]
+        return moved, offset["y"]
+
+    def test_learns_the_real_distance_per_notch_and_stops_short_of_the_target(self):
+        moved, offset = self.drive(400)
+        self.assertAlmostEqual(self.learned, 150, delta=4)
+        self.assertTrue(250 <= offset <= 400, offset)  # within a notch of the target, and not past it
+        self.assertEqual(self.wheel[0], -mcq_agent.WHEEL_NOTCH)  # the first notch measures the page
+
+    def test_never_turns_more_than_two_notches_at_once_however_wrong_the_estimate(self):
+        moved, offset = self.drive(900, learned=40)
+        self.assertTrue(all(abs(amount) <= mcq_agent.MAX_EVENT * mcq_agent.WHEEL_NOTCH for amount in self.wheel), self.wheel)
+        self.assertAlmostEqual(self.learned, 150, delta=4)
+        self.assertTrue(750 <= offset <= 900, offset)
+
+    def test_a_short_move_at_the_end_of_a_page_does_not_spoil_the_next_page(self):
+        self.drive(600, stuck_at=80)
+        self.assertAlmostEqual(self.learned, 80, delta=4)
+        moved, offset = self.drive(450, learned=self.learned)
+        self.assertAlmostEqual(self.learned, 150, delta=4)
+        self.assertTrue(300 <= offset <= 450, offset)
+
+    def test_measures_in_screen_pixels_when_the_screenshot_is_downscaled(self):
+        moved, offset = self.drive(300, scale=0.5)
+        self.assertAlmostEqual(self.learned, 150, delta=8)
+        self.assertTrue(150 <= offset <= 300, offset)
+
+    def test_uses_what_it_learned_on_the_next_scroll(self):
+        moved, offset = self.drive(300, learned=150)
+        self.assertEqual(self.wheel, [-2 * mcq_agent.WHEEL_NOTCH])
+        self.assertEqual(offset, 300)
+        self.assertAlmostEqual(moved, 300, delta=4)
+
+    def test_stops_when_the_page_cannot_scroll_further(self):
+        moved, offset = self.drive(600, stuck_at=0)
+        self.assertEqual(len(self.wheel), 1)
+        self.assertEqual(offset, 0)
+        self.assertEqual(moved, 0)
+
+    def test_scrolls_back_up_for_a_negative_distance(self):
+        moved, offset = self.drive(-300, start=900)
+        self.assertLessEqual(abs(offset - 600), 75)
+        self.assertTrue(all(amount > 0 for amount in self.wheel))
 
 
 class ActionTest(unittest.TestCase):
@@ -199,20 +331,58 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(self.action("next", "Next", remaining="last"), "next")
 
 
+class FakeQuiz:
+    """A white page whose options turn dark when clicked, and whose content changes after Next or Submit.
+
+    registers=False makes clicks on options change nothing, as a click that misses does;
+    advances=False makes Next change nothing. The page also changes by itself on the
+    screenshots numbered in drift_at, or on every screenshot when restless.
+    """
+
+    def __init__(self, registers=True, advances=True, drift_at=(), restless=False):
+        self.registers, self.advances, self.drift_at, self.restless = registers, advances, drift_at, restless
+        self.marks = []
+        self.page = 0
+        self.shots = 0
+
+    def image(self, sct=None, monitor=None):
+        self.shots += 1
+        if self.restless or self.shots in self.drift_at:
+            self.page += 1
+        image = Image.new("RGB", (MONITOR["width"], MONITOR["height"]), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((50, 50, 950, 60 + 5 * self.page), fill="black")  # a block that grows with every page
+        for x, y in self.marks:
+            draw.rectangle((x - 10, y - 10, x + 10, y + 10), fill="black")
+        return image
+
+    def click(self, x, y):
+        if (x, y) in ((NEXT.x, NEXT.y), (SUBMIT.x, SUBMIT.y)):
+            if self.advances:
+                self.page += 1
+                self.marks = []
+        elif self.registers:
+            self.marks.append((x, y))
+
+
 class RunLoopTest(unittest.TestCase):
     """Drives run() with scripted screens, recording clicks instead of performing them."""
 
-    def play(self, reads, max_steps=20):
-        """Returns the click positions and scroll count; self.calls keeps every screen and mouse call in order."""
+    def play(self, reads, max_steps=20, quiz=None):
+        """Returns the click positions and scroll count; self.calls keeps every screen and mouse call in order.
+
+        With a FakeQuiz the screenshots come from it and the clicks land on it; without one there are none.
+        """
         reads = iter(reads)
         self.calls = mock.Mock()
         with (
-            mock.patch.object(mcq_agent, "capture", return_value=None) as capture,
+            mock.patch.object(mcq_agent, "capture", side_effect=quiz.image if quiz else lambda *_: None) as capture,
             mock.patch.object(mcq_agent, "read_screen", side_effect=lambda *_: next(reads)),
             mock.patch.object(mcq_agent, "wobble", STILL),
+            mock.patch.dict(mcq_agent.learned, {"per_notch": None}),
             mock.patch.object(mcq_agent, "glide") as glide,
             mock.patch.object(mcq_agent.time, "sleep") as sleep,
-            mock.patch.object(mcq_agent.pyautogui, "click") as click,
+            mock.patch.object(mcq_agent.pyautogui, "click", side_effect=quiz.click if quiz else None) as click,
             mock.patch.object(mcq_agent.pyautogui, "scroll") as scroll,
             mock.patch("builtins.print") as printed,
         ):
@@ -267,13 +437,17 @@ class RunLoopTest(unittest.TestCase):
 
     def test_scrolls_with_the_mouse_over_the_page(self):
         _, scrolls = self.play([
+            screen(question("Q1"), action="scroll"),
             screen(question("Q1", selected=["B"]), action="scroll"),
+            screen(question("Q2"), action="finish"),
             screen(question("Q2", selected=["B"]), action="finish"),
         ])
         self.assertEqual(scrolls, 1)
-        self.assertEqual(self.calls.mock_calls[3:6], [
+        notches = round(mcq_agent.SCROLL_FRACTION * MONITOR["height"] / mcq_agent.PIXELS_PER_NOTCH)
+        at = self.calls.mock_calls.index(mock.call.scroll(-notches * mcq_agent.WHEEL_NOTCH))
+        self.assertEqual(self.calls.mock_calls[at - 1:at + 2], [
             mock.call.glide(500, 500, MONITOR),
-            mock.call.scroll(mcq_agent.SCROLL_AMOUNT),
+            mock.call.scroll(-notches * mcq_agent.WHEEL_NOTCH),
             mock.call.glide(REST_X, 500, MONITOR, pace=1.3),
         ])
 
@@ -294,7 +468,7 @@ class RunLoopTest(unittest.TestCase):
     def test_jittery_positions_do_not_defeat_the_stuck_detector(self):
         reads = [submit_screen(question("Q1", selected=["B"]), position=Point(x=500 + i % 3, y=600 - i % 2)) for i in range(10)]
         clicks, _ = self.play(reads)
-        self.assertEqual(len(clicks), mcq_agent.MAX_STUCK)
+        self.assertEqual(len(clicks), 1 + mcq_agent.MAX_STUCK)  # the answer, then Submit until the screen stops changing
 
     def test_submits_each_question_on_a_page_and_reclicks_one_that_lost_its_selection(self):
         first, second = Point(x=500, y=350), Point(x=500, y=650)
@@ -340,20 +514,21 @@ class RunLoopTest(unittest.TestCase):
 
     def test_refuses_a_submit_that_sounds_like_the_end_of_the_quiz(self):
         for label in ("Submit quiz", "Finish", "Submit all answers", "End test", "Done", "Submit assessment", "Enviar"):
-            clicks, _ = self.play([submit_screen(question(selected=["B"]), label=label, records="this question")])
-            self.assertEqual(clicks, [], label)
+            clicks, _ = self.play([submit_screen(question(selected=["B"]), label=label, records="this question")] * 2)
+            self.assertEqual(clicks, [(100, 250)], label)  # the answer, never the button
 
     def test_bare_submit_is_clicked_only_when_the_model_says_it_records_this_question(self):
-        clicks, _ = self.play([submit_screen(question(selected=["B"]), label="Submit", records="unknown")])
-        self.assertEqual(clicks, [])
+        clicks, _ = self.play([submit_screen(question(selected=["B"]), label="Submit", records="unknown")] * 2)
+        self.assertEqual(clicks, [(100, 250)])
         self.assertIn("records one answer or ends the quiz", self.printed)
-        clicks, _ = self.play([submit_screen(question(selected=["B"]), label="Submit", records="whole quiz")])
-        self.assertEqual(clicks, [])
+        clicks, _ = self.play([submit_screen(question(selected=["B"]), label="Submit", records="whole quiz")] * 2)
+        self.assertEqual(clicks, [(100, 250)])
         clicks, _ = self.play([
+            submit_screen(question(selected=["B"]), label="Submit", records="this question", remaining="unknown"),
             submit_screen(question(selected=["B"]), label="Submit", records="this question", remaining="unknown"),
             screen(action="finish"),
         ])
-        self.assertEqual(clicks, [(500, 600)])
+        self.assertEqual(clicks, [(100, 250), (500, 600)])
 
     def test_labels_that_promise_one_answer_or_moving_on_are_clicked_without_a_counter(self):
         for label in ("Check", "Submit & Next", "Submit answer", "Save and continue"):
@@ -369,9 +544,10 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(clicks, [])
         self.assertIn("No question is in view", self.printed)
 
-    def test_submits_a_question_the_user_had_already_answered(self):
-        clicks, _ = self.play([submit_screen(question(selected=["B"])), screen(action="finish")])
-        self.assertEqual(clicks, [(500, 600)])
+    def test_a_mark_seen_at_first_sight_is_clicked_anyway_before_the_submit(self):
+        # A hover highlight or a misread looks like a mark; clicking a chosen option again changes nothing.
+        clicks, _ = self.play([submit_screen(question(selected=["B"]))] * 2 + [screen(action="finish")])
+        self.assertEqual(clicks, [(100, 250), (500, 600)])
 
     def test_control_that_says_next_is_treated_as_next_even_if_called_submit(self):
         clicks, _ = self.play([
@@ -392,22 +568,22 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(clicks, [(100, 250), (700, 600), (700, 600)])
 
     def test_icon_only_next_is_clicked_unless_it_is_the_last_page(self):
-        clicks, _ = self.play([next_screen(question(selected=["B"]), label="→"), screen(action="finish")])
-        self.assertEqual(clicks, [(700, 600)])
-        clicks, _ = self.play([next_screen(question(selected=["B"]), label="", remaining="last")])
-        self.assertEqual(clicks, [])
+        clicks, _ = self.play([next_screen(question(selected=["B"]), label="→")] * 2 + [screen(action="finish")])
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        clicks, _ = self.play([next_screen(question(selected=["B"]), label="", remaining="last")] * 2)
+        self.assertEqual(clicks, [(100, 250)])
 
     def test_never_clicks_a_next_that_is_really_previous(self):
         clicks, _ = self.play([next_screen(question(selected=["B"]), label="Previous")] * 5)
-        self.assertEqual(clicks, [])
+        self.assertEqual(clicks, [(100, 250)])
 
     def test_next_that_would_end_the_quiz_is_left_to_the_user(self):
-        clicks, _ = self.play([next_screen(question(selected=["B"]), label="Finish")])
-        self.assertEqual(clicks, [])
+        clicks, _ = self.play([next_screen(question(selected=["B"]), label="Finish")] * 2)
+        self.assertEqual(clicks, [(100, 250)])
 
     def test_next_is_still_clicked_on_the_last_question(self):
-        clicks, _ = self.play([next_screen(question(selected=["B"]), remaining="last"), screen(action="finish")])
-        self.assertEqual(clicks, [(700, 600)])
+        clicks, _ = self.play([next_screen(question(selected=["B"]), remaining="last")] * 2 + [screen(action="finish")])
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
 
     def test_questions_with_the_same_wording_but_other_options_are_answered_separately(self):
         clicks, _ = self.play([
@@ -437,8 +613,8 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(clicks, [(100, 250), (700, 600), (100, 200)])
 
     def test_never_clicks_the_finish_button(self):
-        clicks, _ = self.play([screen(question(selected=["B"]), action="finish", position=SUBMIT, label="Submit")])
-        self.assertEqual(clicks, [])
+        clicks, _ = self.play([screen(question(selected=["B"]), action="finish", position=SUBMIT, label="Submit")] * 2)
+        self.assertEqual(clicks, [(100, 250)])
 
     def test_page_that_advances_by_itself_gets_no_next_click(self):
         clicks, _ = self.play([
@@ -458,15 +634,69 @@ class RunLoopTest(unittest.TestCase):
 
     def test_stops_when_next_does_not_change_the_page(self):
         clicks, _ = self.play([next_screen(question(selected=["B"]))] * 10)
-        self.assertEqual(len(clicks), mcq_agent.MAX_STUCK)
+        self.assertEqual(len(clicks), 1 + mcq_agent.MAX_STUCK)
 
     def test_stops_when_there_is_no_quiz(self):
         clicks, _ = self.play([screen()] * 10)
         self.assertEqual(clicks, [])
 
-    def test_stops_when_a_click_never_registers(self):
-        with self.assertRaises(AgentStop):
-            self.play([screen(question())] * 10)
+    def test_gives_up_on_a_question_after_two_tries_and_carries_on(self):
+        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [
+            next_screen(question("Q2", answers=["A"])),
+            next_screen(question("Q2", answers=["A"], selected=["A"])),
+            screen(action="finish"),
+        ])
+        self.assertEqual(clicks, [(100, 250), (100, 250), (700, 600), (100, 200), (700, 600)])
+        self.assertIn("Moving on", self.printed)
+        self.assertIn("Answered 1 question", self.printed)
+
+    def test_stops_after_two_questions_in_a_row_whose_clicks_never_register(self):
+        with self.assertRaisesRegex(AgentStop, "two questions in a row"):
+            self.play([next_screen(question("Q1"))] * 3 + [next_screen(question("Q2", answers=["A"]))] * 3)
+
+    def test_a_question_that_does_register_resets_the_failure_count(self):
+        self.play(
+            [next_screen(question("Q1"))] * 3
+            + [next_screen(question("Q2", answers=["A"])), next_screen(question("Q2", answers=["A"], selected=["A"]))]
+            + [next_screen(question("Q3"))] * 3 + [screen(action="finish")]
+        )
+        self.assertEqual(self.printed.count("Moving on"), 2)
+
+    def test_a_click_the_pixels_confirm_is_not_repeated_when_the_model_sees_no_mark(self):
+        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")], quiz=FakeQuiz())
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertNotIn("Moving on", self.printed)
+
+    def test_a_click_that_changed_nothing_is_tried_once_more_then_the_question_is_left(self):
+        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [
+            next_screen(question("Q2", answers=["A"])),
+            next_screen(question("Q2", answers=["A"], selected=["A"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz(registers=False))
+        self.assertEqual(clicks, [(100, 250), (100, 250), (700, 600), (100, 200), (700, 600)])
+        self.assertIn("Moving on", self.printed)
+
+    def test_waits_for_the_page_to_change_after_next_instead_of_a_fixed_pause(self):
+        self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")], quiz=FakeQuiz())
+        sleeps = [c.args[0] for c in self.calls.sleep.call_args_list]
+        self.assertNotIn(mcq_agent.PAGE_SETTLE, sleeps)
+        self.assertLess(sleeps.count(mcq_agent.POLL_SECONDS), 6)  # one poll sees the change, two more see it hold still
+
+    def test_reads_again_after_a_long_wait_when_next_changed_nothing(self):
+        clicks, _ = self.play([next_screen(question("Q1"))] + [next_screen(question("Q1", selected=["B"]))] * 8, quiz=FakeQuiz(advances=False))
+        sleeps = [c.args[0] for c in self.calls.sleep.call_args_list]
+        self.assertEqual(clicks, [(100, 250), (700, 600), (700, 600)])
+        self.assertGreaterEqual(sleeps.count(mcq_agent.POLL_SECONDS), 2 * round(mcq_agent.CHANGE_TIMEOUT / mcq_agent.POLL_SECONDS))
+
+    def test_a_page_that_changed_during_the_read_is_read_again_before_anything_is_clicked(self):
+        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [screen(action="finish")], quiz=FakeQuiz(drift_at={2}))
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertEqual(self.printed.count("changed while I was reading"), 1)
+
+    def test_a_page_that_never_holds_still_is_acted_on_after_two_fresh_reads(self):
+        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [screen(action="finish")] * 3, quiz=FakeQuiz(restless=True))
+        self.assertEqual(clicks, [(100, 250)])
+        self.assertEqual(self.printed.count("changed while I was reading"), 4)  # two before the click, two before finishing
 
     def test_scrolls_a_cut_off_question_into_view_before_answering(self):
         tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
@@ -477,25 +707,48 @@ class RunLoopTest(unittest.TestCase):
             screen(action="finish"),
         ])
         self.assertEqual(scrolls, 1)
-        self.calls.scroll.assert_called_once_with(mcq_agent.fit_scroll(tall.position, MONITOR))
+        notches = round(mcq_agent.fit_scroll(tall.position, MONITOR) / mcq_agent.PIXELS_PER_NOTCH)
+        self.calls.scroll.assert_called_once_with(-notches * mcq_agent.WHEEL_NOTCH)
         self.assertEqual(clicks, [(100, 350), (700, 600)])
         self.assertIn("Scrolling to see the rest of: Q1", self.printed)
 
-    def test_second_scroll_for_the_same_question_is_a_small_step(self):
+    def test_question_still_cut_off_after_two_scrolls_asks_for_a_zoom_out(self):
         tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
         nearer = question("Q1", answers=[], options=("3", "4"), y=400, cut_off=True)
+        with self.assertRaisesRegex(AgentStop, "Zoom the browser out"):
+            self.play([screen(tall, action="scroll"), screen(nearer, action="scroll"), screen(nearer, action="scroll")])
+        self.assertEqual(self.calls.scroll.call_count, 2)
+
+    def test_scrolls_back_up_when_the_question_went_off_the_top(self):
+        tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
         clicks, _ = self.play([
             screen(tall, action="scroll"),
-            screen(nearer, action="scroll"),
+            screen(action="next", position=NEXT, label="Next", remaining="more"),  # nothing in view: it overshot
             next_screen(question("Q1", y=300)),
             next_screen(question("Q1", y=300, selected=["B"])),
             screen(action="finish"),
         ])
-        self.assertEqual(self.calls.scroll.call_args_list, [
-            mock.call(mcq_agent.fit_scroll(tall.position, MONITOR)),
-            mock.call(mcq_agent.FIT_STEP),
-        ])
+        self.assertEqual([c.args[0] for c in self.calls.scroll.call_args_list][1:], [mcq_agent.WHEEL_NOTCH])
         self.assertEqual(clicks, [(100, 350), (700, 600)])
+        self.assertIn("scrolling back", self.printed)
+
+    def test_gives_up_scrolling_back_after_two_tries(self):
+        tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
+        clicks, _ = self.play([
+            screen(tall, action="scroll"),
+            screen(action="next", position=NEXT, label="Next", remaining="more"),
+            screen(action="next", position=NEXT, label="Next", remaining="more"),
+            screen(action="next", position=NEXT, label="Next", remaining="more"),
+            screen(action="finish"),
+        ])
+        self.assertEqual(self.calls.scroll.call_count, 3)
+        self.assertEqual(clicks, [(700, 600)])
+
+    def test_question_cut_off_with_its_top_already_at_the_top_stops_without_scrolling(self):
+        high = question("Q1", answers=[], options=("3", "4"), y=200, cut_off=True)
+        with self.assertRaisesRegex(AgentStop, "Zoom the browser out"):
+            self.play([screen(high, action="scroll")])
+        self.calls.scroll.assert_not_called()
 
     def test_question_that_never_fits_asks_for_a_zoom_out(self):
         tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
