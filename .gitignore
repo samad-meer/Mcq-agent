@@ -3,6 +3,9 @@
 __pycache__/
 *.pyc
 
+# API keys
+.env
+
 # Agent output: screenshots of this computer's screen and saved reads
 last_read.jpg
 reads/

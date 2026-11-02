@@ -24,12 +24,27 @@ Use `--model` to pick any other vision model from the same provider:
 
 ## Set up on a new PC: setup.bat
 
-Works on a Windows 10 or 11 PC with nothing installed. With the internet connected:
+Works on a Windows 10 or 11 PC with nothing installed, without admin rights. With the internet connected:
 
-1. Copy this folder to the PC (or download it from GitHub with Code, then Download ZIP, and unzip it).
-2. Double-click `setup.bat`. If the PC has no Python 3.13, it downloads it from python.org and installs it for your user account, which needs no admin rights. Then it installs the exact package versions in `requirements.txt`.
-3. When it asks, paste a Gemini API key. Each person needs their own free key from https://aistudio.google.com/apikey, because the free daily limit belongs to the key's project.
-4. Run `run.bat` as described below. `setup.bat` only needs to run again if a file in this folder changes.
+1. Get the folder onto the PC: on GitHub choose Code, then Download ZIP; right-click the ZIP, choose Extract All, and put the extracted folder somewhere short, such as the Desktop or `C:\mcq-agent` (very deep folders break the install). If you copy the folder from another PC instead, leave its `.venv` folder behind; `setup.bat` makes a new one.
+2. Open the extracted folder (not the ZIP window) and double-click `setup.bat`. If Windows asks whether you want to run it, choose Run. If the PC has no Python 3.13, it downloads it from python.org and installs it for your user account. Then it installs the exact package versions in `requirements.txt`. Allow a few minutes.
+3. When it asks, paste a Gemini API key. Each person needs their own free key from https://aistudio.google.com/apikey, because the free daily limit belongs to the key's project. Use the Copy button next to the key, so no spaces come along. The key is saved in the `.env` file in this folder.
+4. Open your quiz and double-click `run.bat`, as described below. To change the key later, edit `.env` or run `setup.bat` again: it offers to replace the saved one.
+
+The quiz has to be on your main monitor: that is the only screen the agent reads, and only that screen's corners stop it.
+
+## Where the keys go: .env
+
+The API keys live in a file named `.env` in this folder, one line per provider. `setup.bat` writes the Gemini key there; for anything else, copy `.env.example` to `.env` and fill in the lines you use:
+
+```
+GEMINI_API_KEY=your-key
+DEEPSEEK_API_KEY=
+XAI_API_KEY=
+GROQ_API_KEY=
+```
+
+The file wins over a key set as a Windows environment variable (`setx`), which still works when the file has no line for that provider. Git ignores `.env`, but a copy of the folder carries it, so never share the folder with it inside.
 
 ## Setup by hand
 
@@ -38,28 +53,15 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-Then set up your provider. Open a new terminal afterwards so `setx` takes effect.
+Then put your provider's key in `.env` as above. For `local`, install Ollama first, then download the model (3.4 GB):
 
 ```powershell
-# grok
-setx XAI_API_KEY "your-key"
-
-# groq
-setx GROQ_API_KEY "your-key"
-
-# gemini
-setx GEMINI_API_KEY "your-key"
-
-# deepseek
-setx DEEPSEEK_API_KEY "your-key"
-
-# local: install Ollama first, then download the model (3.4 GB)
 ollama pull gemma3:4b
 ```
 
 ## Quickest way: run.bat
 
-`run.bat` uses Gemini with the fast `gemini-3.5-flash-lite` model. Open the quiz, run `run.bat` (or double-click it), switch to the quiz within 10 seconds and leave the mouse alone. The mouse moves to each correct option, clicks it and moves on. To stop it, move the mouse to a screen corner.
+`run.bat` uses Gemini with the fast `gemini-3.5-flash-lite` model. Open the quiz, double-click `run.bat` (in a PowerShell window type `.\run.bat`), switch to the quiz within 10 seconds and leave the mouse alone. The mouse moves to each correct option, clicks it and moves on. To stop it, move the mouse to a corner of the main monitor.
 
 - `run.bat --dry-run` points the mouse at the answer without clicking and prints what it would click next, such as `Navigation: submit (Submit answer)`. Use it first on a site you haven't tried before.
 - Other options pass through, for example `run.bat --model gemini-3.8-flash` for harder questions. That model is much slower on the free tier.
@@ -89,16 +91,16 @@ The demo quiz shows your score after you press Submit.
 
 1. Take a screenshot.
 2. The model reads it and returns each question, the correct option, what is already selected, and where to click. A question whose options run below the bottom of the screen is reported as cut off.
-3. Before clicking anything, take another screenshot and compare it with the one the model read. If the page changed in the meantime (some quizzes move on by themselves), read it again instead of clicking a page that is no longer there.
-4. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option and compare the pixels around the click before and after: if they changed, the click registered, whatever the next read says about which option looks selected. A question the model reports as already selected on first sight is clicked anyway when it has one answer, because a hover highlight or a misread looks the same and clicking a chosen option again changes nothing.
+3. Before clicking anything, take another screenshot and compare the part of it the model read (around the questions, options and button it placed) with the first one. If that part changed in the meantime (some quizzes move on by themselves), read it again instead of clicking a page that is no longer there. Changes elsewhere, such as a scrollbar fading at the edge, are ignored.
+4. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option and compare the pixels across the option's row before and after: if they changed (a radio filling, a card changing colour), the click registered, whatever the next read says about which option looks selected. A question the model reports as already selected on first sight is clicked anyway when it has one answer, because a hover highlight or a misread looks the same and clicking a chosen option again changes nothing.
 5. If every click on the page registered and nothing else on the page changed, it moves on at once with the Next, Submit or scroll the model already found, so most questions need one model call. It reads the page again first when a click could not be confirmed, when the page reacted to the click (feedback appeared), when Next has no clear label, on the last question, or always with `--careful`.
-6. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) before reading it, so a slow page is not mistaken for a Next button that did nothing.
+6. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) and then hold still before reading it, so a slow page is not mistaken for a Next button that did nothing. If a read then shows no question at all, it waits a moment and reads again before it would scroll, because a page that reloads is blank for a moment.
 
 ## When it stops
 
 - **Last question:** it stops before the button that ends the whole quiz. It only clicks a Submit that records one answer: the button's own text has to say so (Submit answer, Check, Submit & Next and the like) or the model has to report that it records only the question in view. A button whose text mentions the quiz, test, exam, finish, end, results, score or similar words, in English and a few other languages, is never clicked, and neither is Previous or Back. On quizzes with a Submit button for each question, it also leaves the last one to you. This depends on the model reading the page right, so run `run.bat --dry-run` on a new site first.
 - **A click doesn't register:** after 2 tries on the same question it prints `Could not select the answer to: ...`, leaves that question for you and moves on. It stops only when this happens on two questions in a row, which means clicks are not reaching the page at all (the quiz window is not in front, or something covers it).
-- **A question doesn't fit on the screen:** it scrolls the question's first line to the top of the page area, measuring how far the page really moves rather than assuming, never more than two wheel notches at a time, and stopping short rather than past the target. If the options are still cut off, or the page does not scroll at all, it asks you to zoom the browser out (Ctrl and minus) and run again. Every scroll prints a line such as `Scroll: asked 450 px, measured 300 px in 2 wheel event(s), 150 px per notch measured`; `the page did not move` on that line means the wheel is not scrolling this page.
+- **A question doesn't fit on the screen:** it scrolls the question's first line to the top of the page area, measuring how far the page really moves rather than assuming, never more than two wheel notches at a time, and landing within half a notch of the target. If the first line is already at the top but the page had been scrolled down on this question, it scrolls back up first, because it has probably scrolled past the question's start. If the options are still cut off after two scrolls, or the page does not scroll at all, it asks you to zoom the browser out (Ctrl and minus) and run again. Every scroll prints a line such as `Scroll: asked 450 px, measured 300 px in 2 wheel event(s), 150 px per notch measured`; `the page did not move` on that line means the wheel is not scrolling this page.
 - **The screen stops changing:** this covers a Next button that does nothing, or no quiz on screen.
 - **You abort:** move the mouse to any corner of the screen.
 

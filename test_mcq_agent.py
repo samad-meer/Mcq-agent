@@ -171,12 +171,12 @@ class CoordinatesTest(unittest.TestCase):
 
 class FitScrollTest(unittest.TestCase):
     def test_brings_the_first_line_up_to_the_top_of_the_page_area(self):
-        # 400 grid rows down is 400 px on the 1001-px monitor.
-        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), MONITOR), 400.4, places=1)
+        # 340 grid rows down is 340 px on the 1001-px monitor.
+        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), MONITOR), 340.3, places=1)
 
     def test_scales_with_the_screen(self):
-        # The same 400 rows are 432 px on a 1080-px screen.
-        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), SCREEN), 432.0, places=1)
+        # The same 340 rows are 367 px on a 1080-px screen.
+        self.assertAlmostEqual(mcq_agent.fit_scroll(Point(x=300, y=600), SCREEN), 367.2, places=1)
 
     def test_a_question_already_at_the_top_has_nowhere_to_go(self):
         self.assertLess(mcq_agent.fit_scroll(Point(x=300, y=150), MONITOR), 0)
@@ -264,10 +264,10 @@ class ScrollPageTest(unittest.TestCase):
             self.learned = mcq_agent.learned["per_notch"]
         return moved, offset["y"]
 
-    def test_learns_the_real_distance_per_notch_and_stops_short_of_the_target(self):
+    def test_learns_the_real_distance_per_notch_and_lands_within_half_a_notch_of_the_target(self):
         moved, offset = self.drive(400)
         self.assertAlmostEqual(self.learned, 150, delta=4)
-        self.assertTrue(250 <= offset <= 400, offset)  # within a notch of the target, and not past it
+        self.assertLessEqual(abs(offset - 400), 75, offset)
         self.assertEqual(self.wheel[0], -mcq_agent.WHEEL_NOTCH)  # the first notch measures the page
 
     def test_never_turns_more_than_two_notches_at_once_however_wrong_the_estimate(self):
@@ -338,12 +338,14 @@ class FakeQuiz:
     advances=False makes Next change nothing. The page also changes by itself on the
     screenshots numbered in drift_at, or on every screenshot when restless. feedback=True
     shows a box under the options after an answer click, as a quiz that marks the answer
-    at once does.
+    at once does. mark_offset moves the mark a click leaves sideways, as a radio button
+    beside the words does. fade_at draws a scrollbar along the right edge until that
+    screenshot, as a browser's overlay scrollbar fades after the mouse stops.
     """
 
-    def __init__(self, registers=True, advances=True, drift_at=(), restless=False, feedback=False):
+    def __init__(self, registers=True, advances=True, drift_at=(), restless=False, feedback=False, mark_offset=0, fade_at=None):
         self.registers, self.advances, self.drift_at, self.restless = registers, advances, drift_at, restless
-        self.feedback = feedback
+        self.feedback, self.mark_offset, self.fade_at = feedback, mark_offset, fade_at
         self.feedback_shown = False
         self.marks = []
         self.page = 0
@@ -355,11 +357,13 @@ class FakeQuiz:
             self.page += 1
         image = Image.new("RGB", (MONITOR["width"], MONITOR["height"]), "white")
         draw = ImageDraw.Draw(image)
-        draw.rectangle((50, 50, 950, 60 + 5 * self.page), fill="black")  # a block that grows with every page
+        draw.rectangle((50, 400, 950, 410 + 5 * self.page), fill="black")  # a block between the options and Next that grows with every page
         for x, y in self.marks:
             draw.rectangle((x - 10, y - 10, x + 10, y + 10), fill="black")
         if self.feedback_shown:
             draw.rectangle((50, 800, 950, 900), fill="black")
+        if self.fade_at is not None and self.shots < self.fade_at:
+            draw.rectangle((985, 100, 1000, 900), fill="gray")
         return image
 
     def click(self, x, y):
@@ -369,7 +373,7 @@ class FakeQuiz:
                 self.marks = []
                 self.feedback_shown = False
         elif self.registers:
-            self.marks.append((x, y))
+            self.marks.append((x + self.mark_offset, y))
             self.feedback_shown = self.feedback
 
 
@@ -769,9 +773,45 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(self.printed.count("changed while I was reading"), 1)
 
     def test_a_page_that_never_holds_still_is_acted_on_after_two_fresh_reads(self):
-        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [screen(action="finish")] * 3, quiz=FakeQuiz(restless=True))
+        clicks, _ = self.play([next_screen(question("Q1"))] * 3 + [screen(action="finish")], quiz=FakeQuiz(restless=True))
         self.assertEqual(clicks, [(100, 250)])
-        self.assertEqual(self.printed.count("changed while I was reading"), 4)  # two before the click, two before finishing
+        self.assertEqual(self.printed.count("changed while I was reading"), 2)  # a finish read places nothing, so it is not re-checked
+
+    def test_a_change_outside_the_quiz_area_such_as_a_scrollbar_fading_is_not_a_page_change(self):
+        clicks, _ = self.play([next_screen(question("Q1")), screen(action="finish")], quiz=FakeQuiz(fade_at=2))
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+        self.assertNotIn("changed while I was reading", self.printed)
+
+    def test_a_radio_that_reacts_beside_the_words_the_model_pointed_at_still_confirms_the_click(self):
+        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")],
+                              quiz=FakeQuiz(mark_offset=250), careful=True)
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+
+    def test_an_empty_read_gets_a_moment_before_the_page_is_scrolled(self):
+        clicks, scrolls = self.play([
+            screen(action="scroll"),
+            screen(action="scroll"),
+            screen(question("Q1"), action="finish"),
+            screen(question("Q1", selected=["B"]), action="finish"),
+        ])
+        self.assertEqual(scrolls, 1)
+        self.assertEqual(self.printed.count("giving the page a moment"), 1)
+        self.assertEqual(clicks, [(100, 250)])
+
+    def test_scrolls_back_up_when_it_scrolled_past_the_start_of_a_question(self):
+        high = question("Q1", answers=[], options=("3", "4"), y=200, cut_off=True)  # its first line is as high as it goes
+        clicks, _ = self.play([
+            screen(action="scroll"),
+            screen(action="scroll"),
+            screen(high, action="scroll"),
+            next_screen(question("Q1", y=300)),
+            next_screen(question("Q1", y=300, selected=["B"])),
+            screen(action="finish"),
+        ])
+        down = round(mcq_agent.SCROLL_FRACTION * MONITOR["height"] / mcq_agent.PIXELS_PER_NOTCH) * mcq_agent.WHEEL_NOTCH
+        self.assertEqual([c.args[0] for c in self.calls.scroll.call_args_list], [-down, down])
+        self.assertEqual(clicks, [(100, 350), (700, 600)])
+        self.assertIn("scrolling back up", self.printed)
 
     def test_scrolls_a_cut_off_question_into_view_before_answering(self):
         tall = question("Q1", answers=[], options=("3", "4"), y=700, cut_off=True)
@@ -998,15 +1038,109 @@ class DryRunTest(unittest.TestCase):
 
 
 class MakeClientTest(unittest.TestCase):
+    def setUp(self):
+        # The real keys file next to the agent must not take part in the tests.
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.keys_file = os.path.join(folder.name, ".env")
+        patcher = mock.patch.object(mcq_agent, "keys_path", return_value=self.keys_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_missing_key_names_the_variable_to_set(self):
         with mock.patch.dict(os.environ, clear=True):
             with self.assertRaisesRegex(AgentStop, "XAI_API_KEY"):
                 mcq_agent.make_client(mcq_agent.PROVIDERS["grok"])
 
+    def test_missing_gemini_key_points_to_setup_bat_and_the_keys_file(self):
+        with mock.patch.dict(os.environ, clear=True):
+            with self.assertRaisesRegex(AgentStop, r"setup\.bat.*\.env"):
+                mcq_agent.make_client(mcq_agent.PROVIDERS["gemini"])
+
+    def test_spaces_and_quotes_around_a_pasted_key_are_dropped(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": ' "AQ.example-key" '}, clear=True):
+            client = mcq_agent.make_client(mcq_agent.PROVIDERS["gemini"])
+        self.assertEqual(client.api_key, "AQ.example-key")
+
+    def test_a_key_of_only_spaces_counts_as_missing(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "   "}, clear=True):
+            with self.assertRaises(AgentStop):
+                mcq_agent.make_client(mcq_agent.PROVIDERS["gemini"])
+
+    def test_the_keys_file_wins_over_the_environment(self):
+        mcq_agent.save_key(self.keys_file, "GEMINI_API_KEY", "from-file")
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "from-env"}, clear=True):
+            client = mcq_agent.make_client(mcq_agent.PROVIDERS["gemini"])
+        self.assertEqual(client.api_key, "from-file")
+        self.assertEqual(mcq_agent.find_key(mcq_agent.PROVIDERS["gemini"]), ("from-file", ".env"))
+
+    def test_the_environment_is_used_when_the_file_has_no_key(self):
+        mcq_agent.save_key(self.keys_file, "XAI_API_KEY", "other")
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "from-env"}, clear=True):
+            key, source = mcq_agent.find_key(mcq_agent.PROVIDERS["gemini"])
+        self.assertEqual((key, source), ("from-env", "the GEMINI_API_KEY environment variable"))
+
     def test_local_needs_no_key(self):
         with mock.patch.dict(os.environ, clear=True):
             client = mcq_agent.make_client(mcq_agent.PROVIDERS["local"])
         self.assertEqual(str(client.base_url), "http://localhost:11434/v1/")
+
+
+class KeysFileTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = os.path.join(folder.name, ".env")
+
+    def test_lines_are_read_leniently(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('# keys\n\nGEMINI_API_KEY = "AQ.x" \nexport XAI_API_KEY=\'k\'\nnot a key line\nGROQ_API_KEY=\n')
+        self.assertEqual(mcq_agent.load_keys(self.path), {"GEMINI_API_KEY": "AQ.x", "XAI_API_KEY": "k", "GROQ_API_KEY": ""})
+
+    def test_a_missing_file_is_empty(self):
+        self.assertEqual(mcq_agent.load_keys(self.path), {})
+
+    def test_save_creates_the_file_then_replaces_the_line(self):
+        mcq_agent.save_key(self.path, "GEMINI_API_KEY", "first")
+        mcq_agent.save_key(self.path, "XAI_API_KEY", "x")
+        mcq_agent.save_key(self.path, "GEMINI_API_KEY", "second")
+        with open(self.path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[0][:1], "#")
+        self.assertEqual(lines[1:], ["GEMINI_API_KEY=second", "XAI_API_KEY=x"])
+
+    def test_save_keeps_other_lines_of_an_existing_file(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("# mine\nGEMINI_API_KEY=\nDEEPSEEK_API_KEY=d\n")
+        mcq_agent.save_key(self.path, "GEMINI_API_KEY", "g")
+        self.assertEqual(mcq_agent.load_keys(self.path), {"GEMINI_API_KEY": "g", "DEEPSEEK_API_KEY": "d"})
+
+
+class WarmUpTest(unittest.TestCase):
+    """Runs warm_up through the real SDK against a fake server that answers the model lookup."""
+
+    def warm_up(self, status, body):
+        def handler(request):
+            return httpx2.Response(status, json=body)
+
+        http_client = openai.DefaultHttpxClient(transport=httpx2.MockTransport(handler))
+        client = openai.OpenAI(api_key="test", base_url="https://test.invalid/v1", http_client=http_client)
+        mcq_agent.warm_up(client, mcq_agent.PROVIDERS["gemini"])
+
+    def test_a_key_gemini_turns_down_stops_before_the_countdown(self):
+        # Gemini's OpenAI-compatible endpoint answers 400, not 401, to a bad key.
+        body = {"error": {"code": 400, "message": "Please pass a valid API key", "status": "INVALID_ARGUMENT"}}
+        with self.assertRaisesRegex(AgentStop, "setup.bat"):
+            self.warm_up(400, body)
+
+    def test_a_401_or_403_stops_too(self):
+        for status in (401, 403):
+            with self.assertRaisesRegex(AgentStop, "did not accept"):
+                self.warm_up(status, {"error": {"message": "nope"}})
+
+    def test_other_errors_are_left_for_the_first_read(self):
+        self.warm_up(404, {"error": {"message": "no such endpoint"}})
+        self.warm_up(400, {"error": {"message": "some other complaint"}})
 
 
 class ReadScreenTest(unittest.TestCase):

@@ -40,8 +40,10 @@ CLICK_SETTLE = 0.3  # after answer clicks; the move away from the option already
 PAGE_SETTLE = 1.0  # after Next, Submit or a scroll, before the page is read again
 CHANGE_TIMEOUT = 3.0  # s to wait for the page to change after Next or Submit before reading it anyway
 POLL_SECONDS = 0.15  # between screenshots while waiting for the page to settle or change
-CHANGE_SHARE = 0.001  # share of the screen that has to differ clearly before the page counts as changed
-CLICK_CHANGE = 0.01  # share of the patch around a click that has to differ before the click counts as registered
+CHANGE_SHARE = 0.001  # share of the quiz area that has to differ clearly before the page counts as changed
+PAD = 0.06  # share of the screen added around the questions and controls a read placed: the area that is compared
+CLICK_PIXELS = 12  # clearly changed pixels across a clicked option's row that show the click registered
+STILL_AFTER_CHANGE = 3  # matching screenshots in a row before a page that just changed counts as loaded
 PATCH = 60  # px across the patch compared before and after a click
 BAND = 900  # px across the strip around a clicked option that may change with it: a card shows its state along its row
 PRESS_SECONDS = (0.05, 0.2)  # range for the pause between arriving on a target and pressing
@@ -58,17 +60,18 @@ wobble = random.Random()  # small variations that keep the movements from repeat
 WHEEL_NOTCH = 120  # one notch of the wheel, in the units pyautogui.scroll passes to Windows
 PIXELS_PER_NOTCH = 100  # a first guess at what one notch scrolls; the real distance is measured on the page
 SCROLL_FRACTION = 0.6  # share of the screen height a plain scroll moves
-SCROLL_TOLERANCE = 1.0  # notches; closer than this to the target counts as there: stopping short beats overshooting
+SCROLL_TOLERANCE = 0.5  # notches; closer than this to the target counts as there, so the last notch rounds to nearest
 MAX_SCROLL_ROUNDS = 3  # wheel events spent reaching one target
 MAX_EVENT = 2  # notches in one wheel event once the distance is known; a longer move cannot be measured
 PER_NOTCH_RANGE = (40, 320)  # px one notch can plausibly move; a measurement outside this is a misread
 MIN_ROWS = 10  # row groups that have to take part before a move can be measured
-FIT_TOP = 200  # grid row a cut-off question's first line is scrolled up to: under the browser's bars, most room below
+FIT_TOP = 260  # grid row a cut-off question's first line is scrolled up to: clear of the browser's bars even half a notch too far up
 MAX_FITS = 2  # scrolls toward that row for one question before concluding it is taller than the screen
 MAX_RECOVERIES = 2  # scrolls back up when a question disappeared off the top after a fit
 learned = {"per_notch": None}  # pixels one wheel notch moves the page, once measured; every clear measurement updates it
 DEBUG_IMAGE = "last_read.jpg"
 DEBUG_FOLDER = "reads"  # --debug saves every screenshot read here
+KEYS_FILE = ".env"  # API keys, one NAME=value line each, next to this script
 # Button labels, in several languages, that end or grade the whole quiz rather than one question.
 ENDS_QUIZ = re.compile(
     r"\b(quiz\w*|tests?|exam\w*|finish\w*|end|complet\w*|all|done|results?|score|grade|assess\w*|assign\w*|form|"
@@ -232,11 +235,72 @@ PROVIDERS = {
 }
 
 
-def make_client(provider):
+def keys_path():
+    """The keys file sits next to this script, whatever folder the agent is started from."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), KEYS_FILE)
+
+
+def clean_key(value):
+    """A pasted key may carry spaces or quotes at either end; a space would even make the request unsendable."""
+    return (value or "").strip().strip('"').strip("'").strip()
+
+
+def load_keys(path):
+    """NAME=value lines from the keys file; comments, blank lines, quotes and spaces are ignored."""
+    keys = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return keys
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        keys[name.strip().removeprefix("export ").strip()] = clean_key(value)
+    return keys
+
+
+def save_key(path, name, value):
+    """Write one key into the keys file, replacing its line when there is one."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = ["# API keys for the MCQ agent, one per line. Keep this file to yourself."]
+    entry = f"{name}={value}"
+    for i, line in enumerate(lines):
+        if line.split("=", 1)[0].strip().removeprefix("export ").strip() == name:
+            lines[i] = entry
+            break
+    else:
+        lines.append(entry)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def find_key(provider):
+    """The provider's API key and where it came from: the keys file first, then the environment."""
     key_env = provider["key_env"]
-    key = os.environ.get(key_env) if key_env else "not-needed"
+    if key_env is None:
+        return "not-needed", "no key needed"
+    key = load_keys(keys_path()).get(key_env, "")
+    if key:
+        return key, KEYS_FILE
+    key = clean_key(os.environ.get(key_env))
+    if key:
+        return key, f"the {key_env} environment variable"
+    return "", ""
+
+
+def make_client(provider):
+    key, _ = find_key(provider)
     if not key:
-        raise AgentStop(f"No API key found. Run: setx {key_env} your-key, then open a new terminal.")
+        key_env = provider["key_env"]
+        if key_env == "GEMINI_API_KEY":
+            raise AgentStop(f"No Gemini API key found. Run setup.bat, or put GEMINI_API_KEY=your-key in {KEYS_FILE} next to mcq_agent.py.")
+        raise AgentStop(f"No API key found. Put {key_env}=your-key in {KEYS_FILE} next to mcq_agent.py.")
     return openai.OpenAI(base_url=provider["base_url"], api_key=key, max_retries=MAX_API_RETRIES)
 
 
@@ -247,10 +311,28 @@ def with_effort(provider, level):
     return {**provider, "reasoning_effort": level}
 
 
+def key_problem(provider, error):
+    """The stop message for a key the service turned down, with the way to replace it."""
+    if provider["key_env"] == "GEMINI_API_KEY":
+        fix = "Run setup.bat again and paste the key again, using the Copy button at https://aistudio.google.com/apikey"
+    else:
+        fix = f"Check {provider['key_env']}."
+    return f"The service did not accept the API key ({error.message}). {fix}"
+
+
 def warm_up(client, provider):
-    """Open the connection during the countdown, so the first read does not pay for it."""
+    """Open the connection during the countdown, so the first read does not pay for it.
+
+    A key the service turns down is caught here too, before the mouse moves or a screenshot
+    is sent. Gemini answers a bad key with 400 rather than 401, so the text is checked.
+    """
     try:
         client.with_options(max_retries=0).models.retrieve(provider["model"])
+    except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
+        raise AgentStop(key_problem(provider, e))
+    except openai.BadRequestError as e:
+        if "api key" in e.message.lower():
+            raise AgentStop(key_problem(provider, e))
     except (openai.APIStatusError, openai.APIConnectionError):
         pass  # not every provider has this endpoint; a real problem shows on the first read
 
@@ -350,20 +432,42 @@ def click(point, monitor, blank=None):
     rest(monitor, y, blank)
 
 
-def patch(image, point, monitor):
-    """The square of a screenshot around a click point."""
-    half = PATCH / 2 * image.width / monitor["width"]  # the screenshot may be downscaled
-    x, y = point.x / GRID * image.width, point.y / GRID * image.height
-    return image.crop((round(x - half), round(y - half), round(x + half), round(y + half)))
-
-
 CLEAR = [0] * 25 + [255] * 231  # brightness differences above 24 count as a change
+
+
+def changed_pixels(before, after):
+    """How many pixels changed clearly between two images of the same size."""
+    return ImageChops.difference(before.convert("L"), after.convert("L")).point(CLEAR).histogram()[255]
 
 
 def differs(before, after, share):
     """True when more than this share of the pixels changed clearly between two images of the same size."""
-    changed = ImageChops.difference(before.convert("L"), after.convert("L")).point(CLEAR)
-    return changed.histogram()[255] > share * changed.width * changed.height
+    return changed_pixels(before, after) > share * before.width * before.height
+
+
+def read_region(read, image):
+    """The part of a screenshot a read covers: around every question, option and control it placed, or None.
+
+    Only this part says whether the page the model read is still there. Outside it, a
+    scrollbar fading, an advert or a clock can change without the quiz changing.
+    """
+    points = [q.position for q in read.questions] + [o.position for q in read.questions for o in q.options]
+    if read.navigation.position:
+        points.append(read.navigation.position)
+    if not points:
+        return None
+    xs = [p.x / GRID * image.width for p in points]
+    ys = [p.y / GRID * image.height for p in points]
+    pad_x, pad_y = PAD * image.width, PAD * image.height
+    return (max(0, round(min(xs) - pad_x)), max(0, round(min(ys) - pad_y)),
+            min(image.width, round(max(xs) + pad_x)), min(image.height, round(max(ys) + pad_y)))
+
+
+def changed_in(before, after, box, share):
+    """True when the page changed inside this box of two screenshots, or anywhere when there is no box."""
+    if box is None:
+        return differs(before, after, share)
+    return differs(before.crop(box), after.crop(box), share)
 
 
 def band_box(image, point, monitor):
@@ -456,8 +560,8 @@ def thumbnail(image):
     return image.convert("L").resize((96, 54)).tobytes()
 
 
-def settle(sct, monitor, before=None):
-    """Wait until two screenshots in a row match, so an animation has finished; returns the last one.
+def settle(sct, monitor, before=None, still=2):
+    """Wait until `still` screenshots in a row match, so an animation has finished; returns the last one.
 
     While the screen still equals the one from before the action it keeps waiting, up to
     PAGE_SETTLE, because a page that has not started to move yet looks just as still as
@@ -465,27 +569,34 @@ def settle(sct, monitor, before=None):
     """
     unchanged = thumbnail(before) if before is not None else None
     last = now = None
+    matched = 1
     for _ in range(round(PAGE_SETTLE / POLL_SECONDS)):
         time.sleep(POLL_SECONDS)
         now = capture(sct, monitor)
         if now is None:
             return None
         thumb = thumbnail(now)
-        if thumb == last and thumb != unchanged:
+        matched = matched + 1 if thumb == last else 1
+        if matched >= still and thumb != unchanged:
             break
         last = thumb
     return now
 
 
-def wait_for_change(sct, monitor, before):
-    """Wait for the page to change after Next or Submit, then to hold still; None when it did not change in time."""
+def wait_for_change(sct, monitor, before, box=None):
+    """Wait for the page to change after Next or Submit, then to hold still; None when it did not change in time.
+
+    Only the box the last read covered counts as the page, so a scrollbar fading at the
+    edge does not pass for the next question. A page that reloads goes blank first, so
+    it has to hold still a little longer before it counts as loaded.
+    """
     for _ in range(round(CHANGE_TIMEOUT / POLL_SECONDS)):
         time.sleep(POLL_SECONDS)
         now = capture(sct, monitor)
         if now is None:
             return None
-        if differs(before, now, CHANGE_SHARE):
-            return settle(sct, monitor)
+        if changed_in(before, now, box, CHANGE_SHARE):
+            return settle(sct, monitor, still=STILL_AFTER_CHANGE)
     return None
 
 
@@ -499,8 +610,8 @@ def scroll_page(sct, monitor, pixels, blank=None):
 
     A wheel notch moves a different distance on every page and display scaling, so the
     agent compares screenshots before and after each wheel event, learns the distance
-    and corrects, instead of trusting a fixed number. It stops short of the target rather
-    than past it. Returns the pixels it measured, or None when the screen could not be read.
+    and corrects, instead of trusting a fixed number, and ends within half a notch of the
+    target. Returns the pixels it measured, or None when the screen could not be read.
     """
     x = monitor["left"] + monitor["width"] // 2 + wobble.randint(-100, 100)
     y = monitor["top"] + monitor["height"] // 2 + wobble.randint(-REST_DRIFT, REST_DRIFT)
@@ -517,10 +628,10 @@ def scroll_page(sct, monitor, pixels, blank=None):
         if abs(notches) < SCROLL_TOLERANCE:
             break
         events += 1
-        # The first notch on a page is a measurement. After that, whole notches that stop short
-        # of the target, and never further than the measurement can follow reliably.
+        # The first notch on a page is a measurement. After that, whole notches toward the
+        # target, and never further than the measurement can follow reliably.
         limit = max(1, math.floor(0.3 * monitor["height"] / per_notch))
-        whole = 1 if learned["per_notch"] is None else min(MAX_EVENT, limit, math.floor(abs(notches)))
+        whole = 1 if learned["per_notch"] is None else min(MAX_EVENT, limit, max(1, math.floor(abs(notches))))
         whole = math.copysign(whole, notches)
         scroll_wheel(whole)
         after = settle(sct, monitor, before)
@@ -782,13 +893,13 @@ def dry_run(client, provider, sct, monitor):
 def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
     """Work through the quiz, one fresh screenshot per action.
 
-    Nothing acts on a stale screen: before anything is clicked, the screen is compared
-    with the one the model read, so pages that advance on their own, or that only show
-    Next after an answer is picked, need no special handling. Whether a click registered
-    is checked on the pixels around it, because models misread which option is marked.
-    Once every click on a page is confirmed that way and nothing else on the page moved,
-    the Next, Submit or scroll the model already found is followed without reading the
-    page again; `careful` asks for that second read every time.
+    Nothing acts on a stale screen: before anything is clicked, the part of the screen the
+    model read is compared with a fresh screenshot, so pages that advance on their own, or
+    that only show Next after an answer is picked, need no special handling. Whether a
+    click registered is checked on the pixels across the option, because models misread
+    which option is marked. Once every click on a page is confirmed that way and nothing
+    else on the page moved, the Next, Submit or scroll the model already found is followed
+    without reading the page again; `careful` asks for that second read every time.
     """
     decided = {}
     attempts = Counter()
@@ -796,12 +907,15 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
     given_up = set()  # questions whose clicks never registered, left for the user
     fits = Counter()  # scrolls made so far to bring each cut-off question into view
     pending_fit = None  # the cut-off question just scrolled for, until it is seen again
+    page_scrolled = 0  # px scrolled down on this page since the last Next or Submit
+    rewound = False  # whether that scrolling was undone once, for a question it had passed
     submitted = set()
     left = set()  # questions already moved past with Next
     answered = 0
     failed = 0  # questions given up on in a row
     stuck = 0
     stale = 0
+    empty_reads = 0  # reads in a row with no question in view
     last_state = None
     if debug:
         os.makedirs(DEBUG_FOLDER, exist_ok=True)
@@ -815,9 +929,10 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
         navigation = read.navigation
         blank = navigation.blank
 
-        # The model takes seconds; a page that changed meanwhile is read again, not clicked.
+        # The model takes seconds; a quiz area that changed meanwhile is read again, not clicked.
         fresh = capture(sct, monitor) if image is not None else None
-        if fresh is not None and stale < MAX_STALE and differs(image, fresh, CHANGE_SHARE):
+        box = read_region(read, image) if image is not None else None
+        if fresh is not None and box is not None and stale < MAX_STALE and changed_in(image, fresh, box, CHANGE_SHARE):
             stale += 1
             print("\nThe page changed while I was reading it, so I'm reading it again.")
             continue
@@ -829,7 +944,9 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
                 pending_fit = None
             elif recoveries < MAX_RECOVERIES:
                 print("\nThe question went off the top of the screen, so I'm scrolling back a little.")
-                scroll_page(sct, monitor, -(learned["per_notch"] or PIXELS_PER_NOTCH))
+                per_notch = learned["per_notch"] or PIXELS_PER_NOTCH
+                moved = scroll_page(sct, monitor, -per_notch)
+                page_scrolled += -per_notch if moved is None else moved
                 pending_fit = (key, recoveries + 1)
                 continue
             else:
@@ -856,7 +973,9 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
                 continue
             print_question(question, decided[key])
             for option in options:
-                clicked.append((key, option, patch(fresh, option.position, monitor) if fresh is not None else None))
+                # The whole row is watched: the radio or tick that reacts may sit beside the words the model pointed at.
+                strip = band_box(fresh, option.position, monitor) if fresh is not None else None
+                clicked.append((key, option, strip, fresh.crop(strip) if strip else None))
                 click(option.position, monitor, blank)
             if attempts[key] == 0:
                 answered += 1
@@ -866,15 +985,15 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             confirmed = False
             if fresh is not None:
                 after = capture(sct, monitor)
-                for key, option, before in clicked:
-                    if differs(before, patch(after, option.position, monitor), CLICK_CHANGE):
+                for key, option, strip, before in clicked:
+                    if changed_pixels(before, after.crop(strip)) >= CLICK_PIXELS:
                         verified.setdefault(key, set()).add(option.label)
                         failed = 0
                 # Every click took and nothing else on the page moved, so the control the model
                 # found is still where it was: no need to read the page again before following it.
                 confirmed = (not careful and not gave_up and reusable(read)
-                             and all(option.label in verified.get(key, ()) for key, option, _ in clicked)
-                             and not changed_elsewhere(fresh, after, [option.position for _, option, _ in clicked],
+                             and all(option.label in verified.get(key, ()) for key, option, _, _ in clicked)
+                             and not changed_elsewhere(fresh, after, [option.position for _, option, _, _ in clicked],
                                                        navigation.position, monitor))
             if not confirmed:
                 continue
@@ -886,11 +1005,23 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             key = normalize(question.text, numbered=True)  # the full key would change as more options come into view
             fits[key] += 1
             pixels = fit_scroll(question.position, monitor)
-            if fits[key] > MAX_FITS or pixels < SCROLL_TOLERANCE * (learned["per_notch"] or PIXELS_PER_NOTCH):
+            if fits[key] > MAX_FITS:
+                raise AgentStop(f"This question does not fit on the screen even after scrolling: {question.text} "
+                                "Zoom the browser out (Ctrl and minus) and run again.")
+            if pixels < SCROLL_TOLERANCE * (learned["per_notch"] or PIXELS_PER_NOTCH):
+                # Its first line is already as high as the wheel can put it. When this page was
+                # scrolled down before, the start of the question is probably above the screen.
+                if page_scrolled > 0 and not rewound:
+                    print(f"\nI scrolled past the start of this question, so I'm scrolling back up: {question.text}")
+                    rewound = True
+                    scroll_page(sct, monitor, -page_scrolled)
+                    page_scrolled = 0
+                    continue
                 raise AgentStop(f"This question does not fit on the screen, or the page cannot be scrolled: {question.text} "
                                 "Zoom the browser out (Ctrl and minus) and run again.")
             print(f"\nScrolling to see the rest of: {question.text}")
-            scroll_page(sct, monitor, pixels)
+            moved = scroll_page(sct, monitor, pixels)
+            page_scrolled += pixels if moved is None else moved
             pending_fit = (key, 0)
             continue
 
@@ -905,7 +1036,16 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
         last_state = state
         if stuck >= MAX_STUCK:
             print("\nThe screen stopped changing, so I'm stopping here.")
+            if not decided:
+                print("No question was found on the main monitor. If the quiz is on another screen, move it to the main one.")
             break
+
+        # A page that has just moved on may still be loading: the first empty read gets a moment, not a scroll.
+        empty_reads = empty_reads + 1 if not read.questions else 0
+        if empty_reads == 1 and action in ("scroll", "none"):
+            print("\nNothing to answer yet; giving the page a moment.")
+            time.sleep(PAGE_SETTLE)
+            continue
 
         if action == "submit" and not submit_is_safe(read):
             if not read.questions:
@@ -925,7 +1065,9 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             left.update(seen)
             click(navigation.position, monitor)  # the page is about to change, so its blank spot is not used
         elif action == "scroll":
-            scroll_page(sct, monitor, SCROLL_FRACTION * monitor["height"])  # waits for the page to settle itself
+            pixels = SCROLL_FRACTION * monitor["height"]
+            moved = scroll_page(sct, monitor, pixels)  # waits for the page to settle itself
+            page_scrolled += pixels if moved is None else moved
             continue
         else:
             time.sleep(PAGE_SETTLE)
@@ -934,7 +1076,8 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
         if fresh is None:
             time.sleep(PAGE_SETTLE)
         else:
-            wait_for_change(sct, monitor, fresh)
+            wait_for_change(sct, monitor, fresh, read_region(read, fresh))
+        page_scrolled, rewound = 0, False
     else:
         print(f"\nStopped after {max_steps} steps.")
 
@@ -954,12 +1097,32 @@ def main():
                         help=f"save every screenshot read, with the click targets drawn, in the {DEBUG_FOLDER} folder")
     parser.add_argument("--careful", action="store_true",
                         help="read the screen again after every answer click before moving on: slower, safest on a new site")
+    parser.add_argument("--save-key", metavar="KEY", help=f"save this API key for the chosen provider in {KEYS_FILE} and exit")
+    parser.add_argument("--check-key", action="store_true",
+                        help="say where the chosen provider's key comes from and exit; exit code 1 when there is none")
     args = parser.parse_args()
 
     provider = dict(PROVIDERS[args.provider])
     if args.model:
         provider["model"] = args.model
     hint = provider.get("hint", "")
+
+    if args.save_key is not None:
+        key = clean_key(args.save_key)
+        if not provider["key_env"]:
+            print(f"The {args.provider} provider needs no key.")
+        elif not key:
+            sys.exit("No key was given.")
+        else:
+            save_key(keys_path(), provider["key_env"], key)
+            print(f"Saved {provider['key_env']} in {KEYS_FILE}.")
+        return
+    if args.check_key:
+        key, source = find_key(provider)
+        if not key:
+            sys.exit(f"No {provider['key_env']} found in {KEYS_FILE} or the environment.")
+        print(f"{provider['key_env']} found in {source}.")
+        return
 
     try:
         if args.effort:
@@ -972,6 +1135,8 @@ def main():
         with mss.MSS() as sct:
             # The abort corners are the primary monitor's, so that is the one to work on.
             monitor = next((m for m in sct.monitors[1:] if m.get("is_primary")), sct.monitors[1])
+            if len(sct.monitors) > 2:
+                print(f"Reading the main monitor only ({monitor['width']}x{monitor['height']}). Keep the quiz on it.")
             if args.dry_run:
                 dry_run(client, provider, sct, monitor)
             else:
@@ -987,7 +1152,9 @@ def main():
     except openai.RateLimitError:
         sys.exit("Rate limited by the API. Wait a minute and run again.")
     except openai.APIStatusError as e:
-        sys.exit(f"API error ({e.status_code}): {e.message}")
+        # Gemini wraps some error bodies in a list, which the SDK leaves out of the message.
+        detail = f" {e.body}" if isinstance(e.body, list) else ""
+        sys.exit(f"API error ({e.status_code}): {e.message}{detail}")
     except openai.APIConnectionError:
         sys.exit(f"Could not reach {provider['base_url']}. {hint}")
 
