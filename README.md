@@ -54,6 +54,7 @@ ollama pull gemma3:4b
 
 - `run.bat --dry-run` points the mouse at the answer without clicking and prints what it would click next, such as `Navigation: submit (Submit answer)`. Use it first on a site you haven't tried before.
 - Other options pass through, for example `run.bat --model gemini-3.8-flash` for harder questions. That model is much slower on the free tier.
+- `run.bat --effort low` makes Gemini think less, which is faster and cheaper (`none`, `low`, `medium` or `high`). Look at the thinking tokens it prints first: if they are already 0, this changes nothing. Check the right-answer count on a known quiz before relying on it.
 
 ## Try it on the demo quiz
 
@@ -94,7 +95,7 @@ The demo quiz shows your score after you press Submit.
 - Keep the quiz visible and don't touch the mouse while it runs. Moving it during a click shifts where the click lands.
 - It only reads your main monitor.
 - Answers can be wrong, especially on image-heavy or very specialized questions.
-- Each question uses at least two model calls.
+- Each question uses at least two model calls. Every call prints its time and token counts, with the thinking tokens when the provider reports them.
 
 ## Tests
 

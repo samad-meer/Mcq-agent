@@ -654,14 +654,17 @@ class MakeClientTest(unittest.TestCase):
 class ReadScreenTest(unittest.TestCase):
     """Runs read_screen through the real SDK against a fake HTTP server."""
 
-    def call(self, provider="grok", replies=None, finish_reason="stop", refusal=None):
+    def call(self, provider="grok", replies=None, finish_reason="stop", refusal=None, usage=None):
+        """provider is a name from PROVIDERS or a settings dict; self.printed collects what read_screen printed."""
+        if isinstance(provider, str):
+            provider = mcq_agent.PROVIDERS[provider]
         expected = next_screen(question())
         replies = iter(replies or [expected.model_dump_json()])
         self.requests = []
 
         def handler(request):
             self.requests.append(request)
-            return httpx2.Response(200, json={
+            body = {
                 "id": "chatcmpl-1",
                 "object": "chat.completion",
                 "created": 0,
@@ -671,11 +674,16 @@ class ReadScreenTest(unittest.TestCase):
                     "finish_reason": finish_reason,
                     "message": {"role": "assistant", "content": next(replies), "refusal": refusal},
                 }],
-            })
+            }
+            if usage:
+                body["usage"] = usage
+            return httpx2.Response(200, json=body)
 
         http_client = openai.DefaultHttpxClient(transport=httpx2.MockTransport(handler))
         client = openai.OpenAI(api_key="test", base_url="https://test.invalid/v1", http_client=http_client)
-        read = mcq_agent.read_screen(client, mcq_agent.PROVIDERS[provider], Image.new("RGB", (640, 360)))
+        with mock.patch("builtins.print") as printed:
+            read = mcq_agent.read_screen(client, provider, Image.new("RGB", (640, 360)))
+        self.printed = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
         return read, expected
 
     def body(self):
@@ -771,6 +779,26 @@ class ReadScreenTest(unittest.TestCase):
     def test_running_out_of_tokens_stops_the_agent(self):
         with self.assertRaises(AgentStop):
             self.call(finish_reason="length")
+
+    def test_effort_is_sent_only_when_asked_for(self):
+        self.call(mcq_agent.with_effort(mcq_agent.PROVIDERS["gemini"], "low"))
+        self.assertEqual(self.body()["reasoning_effort"], "low")
+        self.call("gemini")
+        self.assertNotIn("reasoning_effort", self.body())
+
+    def test_effort_is_refused_for_providers_that_do_not_take_it(self):
+        with self.assertRaisesRegex(AgentStop, "--effort"):
+            mcq_agent.with_effort(mcq_agent.PROVIDERS["grok"], "low")
+
+    def test_each_model_call_reports_its_time_and_tokens(self):
+        usage = {"prompt_tokens": 1900, "completion_tokens": 240, "total_tokens": 2140,
+                 "completion_tokens_details": {"reasoning_tokens": 1100}}
+        self.call(usage=usage)
+        self.assertRegex(self.printed, r"Model: \d+\.\d s, tokens in 1900 / out 240 / thinking 1100")
+
+    def test_missing_usage_is_reported_as_unknown(self):
+        self.call()
+        self.assertIn("tokens unknown", self.printed)
 
 
 if __name__ == "__main__":

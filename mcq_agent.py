@@ -201,6 +201,7 @@ PROVIDERS = {
         "key_env": "GEMINI_API_KEY",
         "model": "gemini-3.8-flash",
         "response_format": SCHEMA_FORMAT,
+        "effort": True,  # accepts reasoning_effort, which sets how much the model thinks
     },
     "local": {
         "base_url": "http://localhost:11434/v1",
@@ -218,6 +219,21 @@ def make_client(provider):
     if not key:
         raise AgentStop(f"No API key found. Run: setx {key_env} your-key, then open a new terminal.")
     return openai.OpenAI(base_url=provider["base_url"], api_key=key, max_retries=MAX_API_RETRIES)
+
+
+def with_effort(provider, level):
+    """The provider settings with a thinking level the model is asked to keep to."""
+    if not provider.get("effort"):
+        raise AgentStop(f"--effort is not supported for {provider['model']}; only the gemini provider takes it.")
+    return {**provider, "reasoning_effort": level}
+
+
+def warm_up(client, provider):
+    """Open the connection during the countdown, so the first read does not pay for it."""
+    try:
+        client.with_options(max_retries=0).models.retrieve(provider["model"])
+    except (openai.APIStatusError, openai.APIConnectionError):
+        pass  # not every provider has this endpoint; a real problem shows on the first read
 
 
 def capture(sct, monitor):
@@ -330,14 +346,25 @@ def fit_scroll(position, monitor):
     return -max(1, round(pixels / PIXELS_PER_NOTCH)) * WHEEL_NOTCH
 
 
+def describe_usage(usage):
+    """Token counts of one model call, with the thinking tokens when the provider reports them."""
+    if usage is None:
+        return "tokens unknown"
+    details = getattr(usage, "completion_tokens_details", None)
+    thinking = getattr(details, "reasoning_tokens", None)
+    return f"tokens in {usage.prompt_tokens} / out {usage.completion_tokens} / thinking {'?' if thinking is None else thinking}"
+
+
 def read_screen(client, provider, image):
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=90, subsampling=0)
     data = base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
     image_url = {"url": f"data:image/jpeg;base64,{data}", **provider.get("image_options", {})}
+    extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
 
     problem = "no reply"
     for _ in range(MAX_READ_TRIES):
+        started = time.perf_counter()
         response = client.chat.completions.create(
             model=provider["model"],
             response_format=provider["response_format"],
@@ -348,7 +375,9 @@ def read_screen(client, provider, image):
                     {"type": "text", "text": "Read this screenshot."},
                 ]},
             ],
+            **extra,
         )
+        print(f"   Model: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
         choice = response.choices[0]
         if choice.message.refusal:
             raise AgentStop(f"The model declined to read this screen: {choice.message.refusal}")
@@ -628,6 +657,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="read the screen once and print the answers, without clicking")
     parser.add_argument("--delay", type=float, default=5, help="seconds to switch to the quiz window before starting")
     parser.add_argument("--max-steps", type=int, default=200, help="stop after this many screen reads")
+    parser.add_argument("--effort", choices=["none", "low", "medium", "high"],
+                        help="how much the model thinks before answering; less is faster and cheaper (gemini only)")
     args = parser.parse_args()
 
     provider = dict(PROVIDERS[args.provider])
@@ -636,9 +667,13 @@ def main():
     hint = provider.get("hint", "")
 
     try:
+        if args.effort:
+            provider = with_effort(provider, args.effort)
         client = make_client(provider)
         print(f"Using {provider['model']}. Starting in {args.delay:g}s. Switch to the quiz. Move the mouse to a screen corner to abort.")
-        time.sleep(args.delay)
+        started = time.monotonic()
+        warm_up(client, provider)
+        time.sleep(max(0.0, args.delay - (time.monotonic() - started)))
         with mss.MSS() as sct:
             # The abort corners are the primary monitor's, so that is the one to work on.
             monitor = next((m for m in sct.monitors[1:] if m.get("is_primary")), sct.monitors[1])

@@ -13,7 +13,9 @@ Done on 2 November 2026:
 - The mouse moves along a curved, eased path with a pause before and after each press ([glide](mcq_agent.py#L241), [click](mcq_agent.py#L304)). You asked for this because straight moves looked unreal. It costs about 2 s per click; see change 8.
 - Per-question Submit buttons are clicked when they are safe ([submit_is_safe](mcq_agent.py#L450)); the Submit that ends the quiz never is.
 
-Still to do: changes 1–5, 7 and 8, and the rest of section 4.
+Also done on 2 November 2026, as the first step of the order of work: the timing line on every model call, `--effort` (Gemini only) and the connection warm-up during the countdown (changes 2 and 7).
+
+Still to do: changes 1, 3, 4, 5 and 8, and the rest of section 4.
 
 ## 1. Where the time goes now
 
@@ -259,7 +261,7 @@ New tests to add: a verified click leads straight to Next with no second read; a
 
 ## 6. Order of work
 
-1. Change 7's timing line and change 2 (`--effort`): about half an hour, and it shows where the time really goes.
+1. Done: the timing line, `--effort` and the warm-up (changes 7 and 2). The next real run shows where the time really goes.
 2. The interim sleeps and `pyautogui.PAUSE` from change 4: ten minutes, about 2.5 s per question.
 3. Done: the `cut_off` flag and the computed scroll, so tall questions are read whole.
 4. `wait_until_still` with its floor and cap, then change 1 with `--careful`, then change 8's `--quick` and the firmer `blank` request. This is the main work.
