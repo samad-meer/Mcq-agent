@@ -296,6 +296,27 @@ is one sentence.
 
 Reply with only JSON matching this schema:
 """ + json.dumps(SECOND_OPINION_SCHEMA)
+ANSWER_PROMPT = """\
+You are an experienced software engineer and solution architect answering one question from \
+a multiple-choice quiz on full-stack development, system design and architecture, git and \
+GitHub, DevOps, or reading code.
+
+Read the scenario closely and weigh every option against what it describes: choose the best \
+answer for that situation, not an option that is merely true in general. Work out what code \
+does by tracing it. For exact commands, flags, keywords or syntax, accept only what the tool's \
+documentation defines.
+
+answers are the labels of the correct options. List more than one only if the question asks \
+for several, for example "select all that apply" or "choose two". reason is one sentence.
+
+Reply with only JSON matching this schema:
+""" + json.dumps(SECOND_OPINION_SCHEMA)
+# Which questions go to the answer model: a scenario, or anything with code or a command in it.
+SCENARIO_WORDS = 20
+CODE_LIKE = re.compile(
+    r"[`{};=]|\w\(|=>|->|::|</?[a-zA-Z][\w-]*>|\$\{\{"
+    r"|\b(def|function|class|import|return|const|let|var|async|await|SELECT|INSERT|UPDATE|JOIN|git|gh|npm|pip|"
+    r"docker|kubectl|curl|sudo)\b")
 
 # All five speak the same API. Each uses the settings its own docs show working with images.
 PROVIDERS = {
@@ -332,6 +353,39 @@ PROVIDERS = {
         "model": "gemma3:4b",
         "response_format": SCHEMA_FORMAT,
         "hint": "Check that Ollama is running and the model is pulled, for example: ollama pull gemma3:4b",
+    },
+    # Text models for --answer-provider. Addresses and model names are from each provider's own
+    # pages, read on 4 November 2026. Plain JSON, because strict schemas are not accepted by every host.
+    "openrouter": {  # one account for GLM-5.3, Kimi K3.1 Pro, DeepSeek, Beam and more
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY",
+        "model": "z-ai/glm-5.3",
+        "response_format": {"type": "json_object"},
+        "extra_body": {"reasoning": {"effort": "low"}},  # GLM-5.3 always thinks; its default is the longest, max
+    },
+    "deepinfra": {
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "key_env": "DEEPINFRA_API_KEY",
+        "model": "zai-org/GLM-5.3",
+        "response_format": {"type": "json_object"},
+    },
+    "together": {
+        "base_url": "https://api.together.ai/v1",
+        "key_env": "TOGETHER_API_KEY",
+        "model": "reflection/Beam-1.0-501B-A23B",
+        "response_format": {"type": "json_object"},
+    },
+    "huggingface": {  # the suffix picks the host: :cheapest, :fastest, or a provider's name
+        "base_url": "https://router.huggingface.co/v1",
+        "key_env": "HF_TOKEN",
+        "model": "zai-org/GLM-5.3:cheapest",
+        "response_format": {"type": "json_object"},
+    },
+    "zai": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "key_env": "ZAI_API_KEY",
+        "model": "glm-5.3",
+        "response_format": {"type": "json_object"},
     },
 }
 
@@ -830,6 +884,14 @@ def describe_usage(usage):
     return f"tokens in {usage.prompt_tokens} / out {usage.completion_tokens} / thinking {'?' if thinking is None else thinking}"
 
 
+def request_extras(provider):
+    """What a provider adds to every request: a thinking level, and fields of its own such as OpenRouter's."""
+    extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
+    if provider.get("extra_body"):
+        extra["extra_body"] = provider["extra_body"]
+    return extra
+
+
 def with_fast(provider):
     """The provider settings for --fast: a shorter reply and a smaller picture."""
     return {**provider, "fast": True}
@@ -849,7 +911,7 @@ def read_screen(client, provider, image):
         image.save(buffer, format="JPEG", quality=90, subsampling=0)
     data = base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
     image_url = {"url": f"data:image/jpeg;base64,{data}", **provider.get("image_options", {})}
-    extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
+    extra = request_extras(provider)
     prompt, shape = (FAST_SYSTEM_PROMPT, FastRead) if fast else (SYSTEM_PROMPT, ScreenRead)
     response_format = reply_format(provider, FAST_SCHEMA_FORMAT) if fast else provider["response_format"]
 
@@ -885,42 +947,71 @@ def read_screen(client, provider, image):
     raise AgentStop(f"The model did not return a valid reading of the screen ({problem}).")
 
 
-def second_opinion(client, provider, question, findings):
-    """Ask the model again, with what the documentation says about the options; None when that fails.
+def ask_text(client, provider, prompt, lines, question, what):
+    """Put a question to a model as text and get back labels of its options; None when that fails.
 
-    Only the words go: the question was read already, and the answer is a matter of syntax.
-    A failure here never stops the run; the first answer stands.
+    A failure here never stops the run: the answer read off the screen stands.
     """
-    lines = [f"Question: {question.text}", "", "Options:"]
-    for option in question.options:
-        lines.append(f"{option.label}. {option.text}")
-        lines.extend(f"   Documentation: {note}" for note in findings.get(option.label, []))
-    lines += ["", f"Your first answer: {', '.join(question.answers)}"]
-    extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
+    extra = request_extras(provider)
     try:
         started = time.perf_counter()
         response = client.chat.completions.create(
             model=provider["model"],
             response_format=reply_format(provider, {
                 "type": "json_schema",
-                "json_schema": {"name": "second_opinion", "schema": SECOND_OPINION_SCHEMA, "strict": True},
+                "json_schema": {"name": "text_answer", "schema": SECOND_OPINION_SCHEMA, "strict": True},
             }),
-            messages=[
-                {"role": "system", "content": SECOND_OPINION_PROMPT},
-                {"role": "user", "content": "\n".join(lines)},
-            ],
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": "\n".join(lines)}],
             **extra,
         )
-        print(f"   Model, second opinion: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
+        print(f"   Model, {what}: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
         reply = SecondOpinion.model_validate_json(response.choices[0].message.content or "")
     except (openai.APIError, ValidationError, IndexError) as e:
-        print(f"   The second opinion failed ({type(e).__name__}), so the first answer stands.")
+        why = f"HTTP {e.status_code}: {e.message[:200]}" if isinstance(e, openai.APIStatusError) else type(e).__name__
+        print(f"   The {what} failed ({why}), so the answer read off the screen stands.")
         return None
     labels = {option.label for option in question.options}
     if not reply.answers or not labels.issuperset(reply.answers):
-        print("   The second opinion named no option shown, so the first answer stands.")
+        print(f"   The {what} named no option shown, so the answer read off the screen stands.")
         return None
     return reply
+
+
+def second_opinion(client, provider, question, findings):
+    """Ask the model again, with what the documentation says about the options; None when that fails.
+
+    Only the words go: the question was read already, and the answer is a matter of syntax.
+    """
+    lines = [f"Question: {question.text}", "", "Options:"]
+    for option in question.options:
+        lines.append(f"{option.label}. {option.text}")
+        lines.extend(f"   Documentation: {note}" for note in findings.get(option.label, []))
+    lines += ["", f"Your first answer: {', '.join(question.answers)}"]
+    return ask_text(client, provider, SECOND_OPINION_PROMPT, lines, question, "second opinion")
+
+
+def hard_question(question):
+    """A scenario, or a question with code or a command in it: what the answer model is for."""
+    texts = [question.text, *(option.text for option in question.options)]
+    return len(question.text.split()) >= SCENARIO_WORDS or any(CODE_LIKE.search(text) for text in texts)
+
+
+def answer_with(answerer, question):
+    """Let the answer model choose, from the question's text alone; returns notes for the log.
+
+    It is not told what the screen reader chose, so its judgement is its own. When it fails,
+    the screen reader's answer stands.
+    """
+    lines = [f"Question: {question.text}", "", "Options:", *(f"{o.label}. {o.text}" for o in question.options)]
+    model = answerer["provider"]["model"]
+    reply = ask_text(answerer["client"], answerer["provider"], ANSWER_PROMPT, lines, question, f"answer ({model})")
+    if reply is None:
+        return [f"Answer model {model} failed; the screen reader's answer was kept"]
+    first = ", ".join(question.answers)
+    agreed = sorted(reply.answers) == sorted(question.answers)
+    question.answers, question.reason = reply.answers, reply.reason
+    print(f"   Answer from {model}: {', '.join(reply.answers)}" + ("" if agreed else f" (the screen reader said {first})"))
+    return [f"Answered by {model}" + (", as the screen reader did" if agreed else f"; the screen reader chose {first}")]
 
 
 def check_documentation(client, provider, question):
@@ -930,19 +1021,19 @@ def check_documentation(client, provider, question):
     against = {label: notes for label, notes in findings.items() if label in question.answers}
     if not against:
         return []
-    notes = [f"{label}: {note}" for label, items in against.items() for note in items]
+    notes = [f"Doc check: {label}: {note}" for label, items in against.items() for note in items]
     for note in notes:
-        print(f"   Doc check: {note}")
+        print(f"   {note}")
     reply = second_opinion(client, provider, question, findings)
     if reply is None:
-        return notes + ["the second opinion failed; the first answer was kept"]
+        return notes + ["Doc check: the second opinion failed; the first answer was kept"]
     if sorted(reply.answers) == sorted(question.answers):
         print(f"   Asked again with that; the answer stays {', '.join(reply.answers)}.")
-        return notes + [f"asked again; the answer stayed {', '.join(reply.answers)}: {reply.reason}"]
+        return notes + [f"Doc check: asked again; the answer stayed {', '.join(reply.answers)}: {reply.reason}"]
     print(f"   Asked again with that; the answer is now {', '.join(reply.answers)}: {reply.reason}")
     first = ", ".join(question.answers)
     question.answers, question.reason = reply.answers, reply.reason
-    return notes + [f"asked again; the answer changed from {first} to {', '.join(reply.answers)}: {reply.reason}"]
+    return notes + [f"Doc check: asked again; the answer changed from {first} to {', '.join(reply.answers)}: {reply.reason}"]
 
 
 def normalize(text, numbered=False):
@@ -1148,7 +1239,7 @@ class AnswerLog:
         lines.append("")
         if question.reason and entry["answers"]:
             lines.append(f"Why: {question.reason}  ")
-        lines.extend(f"Doc check: {note}  " for note in entry["notes"])
+        lines.extend(f"{note}  " for note in entry["notes"])
         timing = [f"model {entry['model']:.1f} s"] if entry["model"] is not None else []
         if entry["started"] is not None:
             timing.append(f"{time.monotonic() - entry['started']:.1f} s on this question")
@@ -1289,7 +1380,8 @@ def dry_run(client, provider, sct, monitor):
         print("The mouse is resting on the last answer.")
 
 
-def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, log=None, controls=None, docs=False):
+def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, log=None, controls=None, docs=False,
+        answerer=None):
     """Work through the quiz, one fresh screenshot per action.
 
     Nothing acts on a stale screen: before anything is clicked, the part of the screen the
@@ -1303,6 +1395,8 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
     `log` keeps each question in answers.md, `controls` are the pause, skip and stop keys,
     and `docs` looks up the commands in a first answer before it is clicked. With a --fast
     provider only the quiz's columns of the screen are sent, once a read has shown where they are.
+    `answerer` ({"client", "provider", "every"}) is a stronger text model that chooses the answer
+    to scenario and code questions, or to every question, while the screen reader places the clicks.
     """
     log = log or AnswerLog(None)
     controls = controls or Controls()
@@ -1311,7 +1405,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
     whole = False  # --fast: send the whole width on the next read
     skipped = set()  # questions the person asked to skip
     skipped_fits = set()  # the same, for questions cut off at the bottom
-    doc_notes = {}
+    notes_for = {}  # question key -> what the answer model and the documentation check said, for the log
     last_read = None
 
     def skip(read):
@@ -1413,11 +1507,18 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
                 pending_fit = None
 
         done = submitted | given_up | skipped
-        if docs:
+        if answerer or docs:
             for question in read.questions:
                 key = key_of(question, decided, done)
-                if not question.cut_off and key not in decided and key not in done:
-                    doc_notes[key] = check_documentation(client, provider, question)
+                if question.cut_off or key in decided or key in done or key in notes_for:
+                    continue
+                notes = []
+                if answerer and (answerer["every"] or hard_question(question)):
+                    notes += answer_with(answerer, question)
+                if docs:  # the answer model, when there is one, also gives the second opinion
+                    asker = answerer or {"client": client, "provider": provider}
+                    notes += check_documentation(asker["client"], asker["provider"], question)
+                notes_for[key] = notes
         before = set(decided)
         pending = pending_clicks(read, decided, done, verified)
         clicking = {key_of(q, decided, done) for q, _ in pending}
@@ -1425,7 +1526,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
             key = key_of(question, decided, done)
             if not question.cut_off and key in decided and key not in before:
                 log.seen(key, question, decided[key], seconds, started)
-                log.note(key, doc_notes.get(key, []))
+                log.note(key, notes_for.get(key, []))
                 if key not in clicking:
                     log.done(key, MARKED)
         keys = {key_of(q, decided, done) for q in read.questions if not q.cut_off}
@@ -1575,6 +1676,37 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
     print(f"Answered {answered} question(s).")
 
 
+def make_answerer(args):
+    """The answer model the options ask for, as run() takes it, or None."""
+    if not (args.answer_provider or args.answer_model):
+        if args.answer_all:
+            raise AgentStop("--answer-all needs --answer-provider or --answer-model.")
+        return None
+    if args.fast:
+        raise AgentStop("The answer model needs each question's full text, which --fast cuts short. Use one or the other.")
+    answer_provider = dict(PROVIDERS[args.answer_provider or args.provider])
+    if args.answer_model:
+        answer_provider["model"] = args.answer_model
+    if args.answer_effort:
+        if "reasoning" in answer_provider.get("extra_body", {}):  # OpenRouter takes it in its own field
+            answer_provider["extra_body"] = {**answer_provider["extra_body"], "reasoning": {"effort": args.answer_effort}}
+        else:
+            answer_provider["reasoning_effort"] = args.answer_effort
+    return {"client": make_client(answer_provider), "provider": answer_provider, "every": args.answer_all}
+
+
+def try_answerer(answerer):
+    """One small question before the quiz, so a wrong model name or a setting the host refuses stops
+    the run now, instead of every answer quietly falling back to the screen reader's."""
+    test = Question(text="What is 2 + 2?", position=Point(x=0, y=0), reason="", cut_off=False, selected=[],
+                    answers=["A"], options=[Option(label="A", text="3", position=Point(x=0, y=0)),
+                                            Option(label="B", text="4", position=Point(x=0, y=1))])
+    if ask_text(answerer["client"], answerer["provider"], ANSWER_PROMPT,
+                ["Question: What is 2 + 2?", "", "Options:", "A. 3", "B. 4"], test, "answer model test") is None:
+        raise AgentStop(f"The answer model {answerer['provider']['model']} did not answer a test question (see the line "
+                        "above). Check --answer-model, --answer-effort and its key.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=PROVIDERS, default="grok", help="who runs the model (default: grok)")
@@ -1594,6 +1726,15 @@ def main():
     parser.add_argument("--no-log", action="store_true", help=f"do not write the answers to {ANSWERS_FILE}")
     parser.add_argument("--no-doc-check", action="store_true",
                         help="do not look up git, gh and GitHub Actions syntax in the documentation")
+    parser.add_argument("--answer-provider", choices=PROVIDERS,
+                        help="whose stronger model answers scenario and code questions from their text, while --provider "
+                             "still reads the screen and places the clicks")
+    parser.add_argument("--answer-model",
+                        help="the model for those answers (default: the answer provider's own; given alone, a model of --provider)")
+    parser.add_argument("--answer-effort", metavar="LEVEL",
+                        help="how much the answer model thinks, in its host's words (often low, medium or high)")
+    parser.add_argument("--answer-all", action="store_true",
+                        help="send every question to the answer model, not only scenario and code questions")
     parser.add_argument("--save-key", metavar="KEY", help=f"save this API key for the chosen provider in {KEYS_FILE} and exit")
     parser.add_argument("--check-key", action="store_true",
                         help="say where the chosen provider's key comes from and exit; exit code 1 when there is none")
@@ -1628,8 +1769,13 @@ def main():
         if args.fast:
             provider = with_fast(provider)
         client = make_client(provider)
+        answerer = make_answerer(args)
         print(f"Using {provider['model']}{' with --fast' if args.fast else ''}. Starting in {args.delay:g}s. "
               "Switch to the quiz. Move the mouse to a screen corner to abort.")
+        if answerer:
+            asked = "Every question" if answerer["every"] else "Scenario and code questions"
+            print(f"{asked} will be answered by {answerer['provider']['model']} "
+                  f"({args.answer_provider or args.provider}), from their text.")
         if not args.dry_run:
             controls = Controls()
             print(controls.start())
@@ -1641,6 +1787,9 @@ def main():
                 print(f"Answers are written to {ANSWERS_FILE}.")
         started = time.monotonic()
         warm_up(client, provider)
+        if answerer:
+            warm_up(answerer["client"], answerer["provider"])  # a bad key for it stops the run here, not mid-quiz
+            try_answerer(answerer)
         time.sleep(max(0.0, args.delay - (time.monotonic() - started)))
         with mss.MSS() as sct:
             # The abort corners are the primary monitor's, so that is the one to work on.
@@ -1651,7 +1800,7 @@ def main():
                 dry_run(client, provider, sct, monitor)
             else:
                 run(client, provider, sct, monitor, args.max_steps, args.debug, args.careful,
-                    log=log, controls=controls, docs=not args.no_doc_check)
+                    log=log, controls=controls, docs=not args.no_doc_check, answerer=answerer)
     except AgentStop as e:
         sys.exit(f"\nStopped: {e}")
     except pyautogui.FailSafeException:

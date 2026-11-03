@@ -393,7 +393,7 @@ class RunLoopTest(unittest.TestCase):
     """Drives run() with scripted screens, recording clicks instead of performing them."""
 
     def play(self, reads, max_steps=20, quiz=None, careful=False, provider=None, log=None, controls=None, docs=False,
-             on_read=None, sleep=None):
+             on_read=None, sleep=None, answerer=None):
         """Returns the click positions and scroll count; self.calls keeps every screen and mouse call in order.
 
         With a FakeQuiz the screenshots come from it and the clicks land on it; without one there
@@ -425,7 +425,8 @@ class RunLoopTest(unittest.TestCase):
         ):
             for name, child in [("capture", capture), ("sleep", slept), ("glide", glide), ("click", click), ("scroll", scroll)]:
                 self.calls.attach_mock(child, name)
-            mcq_agent.run(None, provider, None, MONITOR, max_steps, careful=careful, log=log, controls=controls, docs=docs)
+            mcq_agent.run(None, provider, None, MONITOR, max_steps, careful=careful, log=log, controls=controls, docs=docs,
+                          answerer=answerer)
         self.printed = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
         self.reads = read.call_count
         return [c.args for c in click.call_args_list], scroll.call_count
@@ -1083,6 +1084,65 @@ class RunLoopTest(unittest.TestCase):
         asked.assert_not_called()
         self.assertEqual(clicks[0], (100, 250))
 
+    # The answer model: a stronger text model chooses the answer to scenario and code questions.
+
+    ANSWERER = {"client": "answer-client", "provider": {"model": "strong-model"}, "every": False}
+
+    def scenario(self, text="Q1", **kw):
+        """A question with a command in its options, so it counts as one for the answer model."""
+        return question(text, options=("git stash", "git reset --hard", "git revert HEAD"), **kw)
+
+    def test_a_scenario_or_code_question_is_answered_by_the_answer_model(self):
+        path = self.log_file()
+        reply = mcq_agent.SecondOpinion(answers=["C"], reason="revert keeps the shared history.")
+        with mock.patch.object(mcq_agent, "ask_text", return_value=reply) as asked:
+            clicks, _ = self.play([next_screen(self.scenario()), next_screen(self.scenario(selected=["C"])),
+                                   screen(action="finish")], answerer=self.ANSWERER, log=mcq_agent.AnswerLog(path, "m"))
+        asked.assert_called_once()
+        self.assertEqual(asked.call_args.args[:3], ("answer-client", {"model": "strong-model"}, mcq_agent.ANSWER_PROMPT))
+        self.assertEqual(clicks[0], (100, 300))  # option C, not the screen reader's B
+        text = self.read_log(path)
+        self.assertIn("**C. git revert HEAD** ← chosen", text)
+        self.assertIn("Why: revert keeps the shared history.", text)
+        self.assertIn("Answered by strong-model; the screen reader chose B", text)
+
+    def test_a_plain_question_keeps_the_screen_readers_answer_and_costs_nothing(self):
+        with mock.patch.object(mcq_agent, "ask_text") as asked:
+            clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])),
+                                   screen(action="finish")], answerer=self.ANSWERER)
+        asked.assert_not_called()
+        self.assertEqual(clicks[0], (100, 250))
+
+    def test_answer_all_sends_plain_questions_too(self):
+        reply = mcq_agent.SecondOpinion(answers=["B"], reason="2 + 2 is 4.")
+        with mock.patch.object(mcq_agent, "ask_text", return_value=reply) as asked:
+            self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")],
+                      answerer={**self.ANSWERER, "every": True})
+        asked.assert_called_once()
+
+    def test_when_the_answer_model_fails_the_screen_readers_answer_is_clicked(self):
+        with mock.patch.object(mcq_agent, "ask_text", return_value=None):
+            clicks, _ = self.play([next_screen(self.scenario()), next_screen(self.scenario(selected=["B"])),
+                                   screen(action="finish")], answerer=self.ANSWERER)
+        self.assertEqual(clicks[0], (100, 250))
+
+    def test_a_question_seen_again_is_not_sent_again(self):
+        reply = mcq_agent.SecondOpinion(answers=["B"], reason="r")
+        with mock.patch.object(mcq_agent, "ask_text", return_value=reply) as asked:
+            self.play([next_screen(self.scenario()), next_screen(self.scenario()), next_screen(self.scenario(selected=["B"])),
+                       screen(action="finish")], answerer=self.ANSWERER)
+        asked.assert_called_once()
+
+    def test_the_answer_model_also_gives_the_documentation_check_its_second_opinion(self):
+        reply = mcq_agent.SecondOpinion(answers=["B"], reason="r")
+        with (
+            mock.patch.object(mcq_agent, "ask_text", return_value=reply),
+            mock.patch.object(mcq_agent, "check_documentation", return_value=[]) as checked,
+        ):
+            self.play([next_screen(self.scenario()), next_screen(self.scenario(selected=["B"])), screen(action="finish")],
+                      answerer=self.ANSWERER, docs=True)
+        self.assertEqual(checked.call_args.args[:2], ("answer-client", {"model": "strong-model"}))
+
     def test_each_question_is_checked_once(self):
         with mock.patch.object(mcq_agent.doc_check, "check", return_value={}) as check:
             self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")],
@@ -1123,6 +1183,147 @@ class QuizViewTest(unittest.TestCase):
         self.assertTrue(mcq_agent.near_view_edge(self.read(500, 210), (200, 800)))
         self.assertFalse(mcq_agent.near_view_edge(self.read(500, 5), (0, 800)))
         self.assertFalse(mcq_agent.near_view_edge(self.read(500, 400), (200, 800)))
+
+
+class HardQuestionTest(unittest.TestCase):
+    def test_scenarios_and_code_go_to_the_answer_model(self):
+        long = question("Your team deploys a web app twice a day and users report that sessions are lost after each "
+                        "release because the in-memory store is wiped. What should you change first?")
+        self.assertTrue(mcq_agent.hard_question(long))
+        for options in (("print(x)", "echo x", "say x"), ("git push", "git pull", "git fetch"), ("x = 1", "x == 1", "x := 1"),
+                        ("<div>", "<span>", "<p>"), ("${{ github.ref }}", "a", "b"), ("SELECT *", "PICK *", "GET *")):
+            self.assertTrue(mcq_agent.hard_question(question("Which one?", options=options)), options)
+
+    def test_plain_short_questions_stay_with_the_screen_reader(self):
+        self.assertFalse(mcq_agent.hard_question(question("What is 2 + 2?")))
+        self.assertFalse(mcq_agent.hard_question(question("Which HTTP status means Not Found?", options=("200", "301", "404"))))
+        self.assertFalse(mcq_agent.hard_question(question("Which planet is largest?", options=("Mars", "Jupiter", "Venus"))))
+
+
+class MakeAnswererTest(unittest.TestCase):
+    def args(self, **kw):
+        values = {"provider": "gemini", "answer_provider": None, "answer_model": None, "answer_all": False, "fast": False,
+                  "answer_effort": None}
+        return mock.Mock(**{**values, **kw})
+
+    def make(self, **kw):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g", "DEEPSEEK_API_KEY": "d", "OPENROUTER_API_KEY": "o",
+                                          "DEEPINFRA_API_KEY": "i"}, clear=True), \
+                mock.patch.object(mcq_agent, "keys_path", return_value=os.path.join(tempfile.gettempdir(), "no-such.env")):
+            return mcq_agent.make_answerer(self.args(**kw))
+
+    def test_off_unless_asked_for(self):
+        self.assertIsNone(self.make())
+
+    def test_a_provider_with_its_own_default_model(self):
+        answerer = self.make(answer_provider="deepseek")
+        self.assertEqual(answerer["provider"]["model"], mcq_agent.PROVIDERS["deepseek"]["model"])
+        self.assertFalse(answerer["every"])
+
+    def test_a_model_alone_is_one_of_the_screen_readers_provider(self):
+        answerer = self.make(answer_model="gemini-3.8-flash", answer_all=True)
+        self.assertEqual(answerer["provider"]["base_url"], mcq_agent.PROVIDERS["gemini"]["base_url"])
+        self.assertEqual(answerer["provider"]["model"], "gemini-3.8-flash")
+        self.assertTrue(answerer["every"])
+
+    def test_refused_with_fast_which_cuts_the_text_short(self):
+        with self.assertRaisesRegex(AgentStop, "--fast"):
+            self.make(answer_provider="deepseek", fast=True)
+
+    def test_answer_all_alone_is_refused(self):
+        with self.assertRaisesRegex(AgentStop, "--answer-all"):
+            self.make(answer_all=True)
+
+    def test_openrouter_thinks_little_unless_told_otherwise(self):
+        self.assertEqual(self.make(answer_provider="openrouter")["provider"]["extra_body"], {"reasoning": {"effort": "low"}})
+        high = self.make(answer_provider="openrouter", answer_effort="high")["provider"]
+        self.assertEqual(high["extra_body"], {"reasoning": {"effort": "high"}})
+        self.assertNotIn("reasoning_effort", high)
+
+    def test_other_hosts_get_a_thinking_level_only_when_asked(self):
+        self.assertNotIn("reasoning_effort", self.make(answer_provider="deepinfra")["provider"])
+        self.assertEqual(self.make(answer_provider="deepinfra", answer_effort="low")["provider"]["reasoning_effort"], "low")
+
+    def test_a_test_question_that_fails_stops_the_run_before_the_quiz(self):
+        answerer = self.make(answer_provider="deepinfra")
+        with mock.patch.object(mcq_agent, "ask_text", return_value=None):
+            with self.assertRaisesRegex(AgentStop, "did not answer a test question"):
+                mcq_agent.try_answerer(answerer)
+        with mock.patch.object(mcq_agent, "ask_text", return_value=mcq_agent.SecondOpinion(answers=["B"], reason="4")):
+            mcq_agent.try_answerer(answerer)
+
+
+class AnswerProvidersTest(unittest.TestCase):
+    def test_every_answer_provider_asks_for_plain_json_and_names_its_key(self):
+        for name in ("openrouter", "deepinfra", "together", "huggingface", "zai"):
+            settings = mcq_agent.PROVIDERS[name]
+            self.assertEqual(settings["response_format"], {"type": "json_object"}, name)
+            self.assertTrue(settings["base_url"].startswith("https://"), name)
+            self.assertTrue(settings["key_env"], name)
+
+    def test_the_keys_template_lists_every_providers_key(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(mcq_agent.__file__)), ".env.example"), encoding="utf-8") as f:
+            template = f.read()
+        for settings in mcq_agent.PROVIDERS.values():
+            if settings["key_env"]:
+                self.assertIn(f"{settings['key_env']}=", template)
+
+
+class AnswerWithTest(unittest.TestCase):
+    """Runs answer_with through the real SDK against a fake HTTP server."""
+
+    def answer(self, reply):
+        self.requests = []
+
+        def handler(request):
+            self.requests.append(request)
+            return httpx2.Response(200, json={
+                "id": "c", "object": "chat.completion", "created": 0, "model": "t",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": reply}}],
+            })
+
+        http_client = openai.DefaultHttpxClient(transport=httpx2.MockTransport(handler))
+        client = openai.OpenAI(api_key="t", base_url="https://test.invalid/v1", http_client=http_client, max_retries=0)
+        self.question = question("Which undoes a pushed commit safely?", options=("git reset --hard", "git revert HEAD"))
+        with mock.patch("builtins.print"):
+            return mcq_agent.answer_with({"client": client, "provider": dict(mcq_agent.PROVIDERS["deepseek"], model="strong"),
+                                          "every": False}, self.question)
+
+    def test_only_the_text_goes_and_not_what_the_screen_reader_chose(self):
+        notes = self.answer('{"answers": ["B"], "reason": "revert adds an undoing commit."}')
+        body = json.loads(self.requests[0].content)
+        self.assertEqual(body["model"], "strong")
+        self.assertEqual(body["messages"][0]["content"], mcq_agent.ANSWER_PROMPT)
+        self.assertEqual(body["messages"][1]["content"],
+                         "Question: Which undoes a pushed commit safely?\n\nOptions:\nA. git reset --hard\nB. git revert HEAD")
+        self.assertEqual(body["response_format"], {"type": "json_object"})  # deepseek takes plain JSON
+        self.assertEqual((self.question.answers, self.question.reason), (["B"], "revert adds an undoing commit."))
+        self.assertEqual(notes, ["Answered by strong, as the screen reader did"])
+
+    def test_a_providers_own_fields_go_with_the_request(self):
+        self.requests = []
+
+        def handler(request):
+            self.requests.append(request)
+            return httpx2.Response(200, json={
+                "id": "c", "object": "chat.completion", "created": 0, "model": "t",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": '{"answers": ["B"], "reason": "r"}'}}],
+            })
+
+        client = openai.OpenAI(api_key="t", base_url="https://test.invalid/v1", max_retries=0,
+                               http_client=openai.DefaultHttpxClient(transport=httpx2.MockTransport(handler)))
+        with mock.patch("builtins.print"):
+            mcq_agent.answer_with({"client": client, "provider": mcq_agent.PROVIDERS["openrouter"], "every": False},
+                                  question("Which?", options=("a", "b")))
+        body = json.loads(self.requests[0].content)
+        self.assertEqual(body["reasoning"], {"effort": "low"})
+        self.assertEqual(body["model"], "z-ai/glm-5.3")
+
+    def test_a_reply_naming_no_option_keeps_the_screen_readers_answer(self):
+        notes = self.answer('{"answers": ["Z"], "reason": "?"}')
+        self.assertEqual(self.question.answers, ["B"])
+        self.assertIn("failed", notes[0])
 
 
 class AttendTest(unittest.TestCase):
@@ -1678,7 +1879,7 @@ class SecondOpinionTest(unittest.TestCase):
         self.assertIsInstance(user, str)
         self.assertIn("A. git commit --undo\n   Documentation: `--undo` is not an option", user)
         self.assertIn("Your first answer: B", user)
-        self.assertEqual(self.body()["response_format"]["json_schema"]["name"], "second_opinion")
+        self.assertEqual(self.body()["response_format"]["json_schema"]["name"], "text_answer")
 
     def test_an_answer_that_is_not_an_option_is_ignored(self):
         self.assertIsNone(self.ask('{"answers": ["Z"], "reason": "?"}'))

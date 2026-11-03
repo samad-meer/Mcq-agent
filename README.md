@@ -90,6 +90,36 @@ Every question is written to `answers.md` in this folder as the run goes: the op
 
 Before clicking an answer to an exact-syntax question, the agent looks up the commands in the chosen option. Git flags and commands are checked against Git's own manual, installed with Git (198 pages). `gh` commands are checked against `gh`'s help when `gh` is installed (`winget install GitHub.cli`). GitHub Actions expressions are checked against the list of context properties in GitHub's reference, such as `github.ref`, `runner.os` and `steps.<id>.outcome`. If the chosen option uses something that does not exist, such as `git push --force-safe`, `gh run rerun --only-failed` or `github.branch`, the agent asks the model once more, as text only, and tells it what the documentation says. The model then answers again, which also handles questions that ask which option is invalid. Nothing is sent when the chosen option checks out, which is almost always the case. `--no-doc-check` turns it off.
 
+### A stronger model for scenario and code questions
+
+The screen reader (Gemini) still reads the screen, finds the options and clicks. With an answer model, the text of each scenario or code question is also sent to a stronger model, which chooses the answer:
+
+```powershell
+run.bat --answer-provider openrouter
+```
+
+| `--answer-provider` | Default model | Key in `.env` | Notes |
+|---|---|---|---|
+| `deepseek` | `deepseek-flash` (DeepSeek V4.1 Flash) | `DEEPSEEK_API_KEY` | The best value found on 4 Nov 2026: $0.15 in / $0.60 out per million tokens off-peak, about 1–2 US cents a quiz. Peak hours (06:00–09:00 and 11:00–15:00 Pakistan time, weekdays) cost double. |
+| `openrouter` | `z-ai/glm-5.3`, thinking set to low | `OPENROUTER_API_KEY` | One account for GLM-5.3, Kimi K3.1 Pro (`--answer-model moonshotai/kimi-k3.1-pro`), DeepSeek and others. Card, AliPay or USDC; 5.5% fee on credit. |
+| `deepinfra` | `zai-org/GLM-5.3` | `DEEPINFRA_API_KEY` | GLM-5.3 at its lowest list price. |
+| `together` | `reflection/Beam-1.0-501B-A23B` | `TOGETHER_API_KEY` | Beam; first purchase at least $15. |
+| `huggingface` | `zai-org/GLM-5.3:cheapest` | `HF_TOKEN` | Picks the cheapest host; card only. |
+| `zai` | `glm-5.3` | `ZAI_API_KEY` | GLM-5.3 direct; its card payments do not support 3-D Secure. |
+
+Prices and payment details are from the providers' own pages on 4 November 2026 and change often.
+
+`--answer-effort LEVEL` sets how much the answer model thinks, in its host's words (often `low`, `medium` or `high`). GLM-5.3, Kimi and Beam always think, and thinking tokens are billed as output, so a lower level is cheaper and quicker. During the countdown the agent asks the answer model one small test question, so a wrong model name, a setting the host refuses or an empty balance stops the run before the quiz, with the host's own message.
+
+- A question goes to the answer model when its text is 20 words or longer (a scenario), or when the question or an option holds code or a command: brackets, `=`, `;`, HTML tags, `${{ }}`, or words such as `git`, `npm`, `docker`, `SELECT`, `def`, `function`. Short factual questions stay with the screen reader. `--answer-all` sends every question.
+- Only the question and its options go, as text, and the answer model is not told what the screen reader chose, so its judgement is its own. One call per question, about 300 tokens in and 50 out.
+- If the call fails, the screen reader's answer is clicked, so a dropped connection never stops the quiz. A key the service turns down stops the run at the start, before the countdown ends.
+- `answers.md` notes which model answered and what the screen reader would have chosen, so you can compare them afterwards.
+- `--answer-model` alone uses a model of the screen reader's provider, for example `run.bat --answer-model gemini-3.8-flash`.
+- It cannot be combined with `--fast`, which cuts question texts short.
+
+Put the answer provider's key in `.env` (see `.env.example` for the names), or save it with `.venv\Scripts\python mcq_agent.py --provider openrouter --save-key YOUR-KEY`.
+
 ## Try it on the demo quiz
 
 Open `demo_quiz.html` in your browser, then run this and switch to the browser within 5 seconds. Add `--provider groq`, `--provider gemini` or `--provider local` if you aren't using Grok.
