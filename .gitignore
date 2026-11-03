@@ -9,3 +9,6 @@ __pycache__/
 # Agent output: screenshots of this computer's screen and saved reads
 last_read.jpg
 reads/
+
+# Answers the agent gave, with the quiz questions
+answers.md

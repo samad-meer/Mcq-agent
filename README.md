@@ -68,6 +68,27 @@ ollama pull gemma3:4b
 - `run.bat --effort low` makes Gemini think less, which is faster and cheaper (`none`, `low`, `medium` or `high`). Look at the thinking tokens it prints first: if they are already 0, this changes nothing. Check the right-answer count on a known quiz before relying on it.
 - `run.bat --debug` saves every screenshot it read, with red circles on the click targets, as `reads\read-001.jpg`, `read-002.jpg` and so on. When a run goes wrong, these show what the agent saw at each step.
 - `run.bat --careful` reads the screen again after every answer before moving on, as earlier versions did. Slower, but the safest choice the first time on a new site.
+- `run_fast.bat` (or `run.bat --fast`) is the quicker variant. After its first read it sends only the columns of the screen that hold the quiz, and it asks for a shorter reply: no reason, and question and option texts cut to their first words (a command stays whole). On the 14-screen test set it got the same 14 answers right as the normal mode, with reads about 0.5 s quicker (median 2.5 s instead of 2.9 s) and half the upload. Use the normal mode when you want the reason for each answer in `answers.md`.
+
+### While it runs: keys
+
+These work from any window, and the quiz page never receives them:
+
+| Key | What it does |
+|---|---|
+| `Ctrl+Alt+P` | Pause. The agent finishes the click it is making, then waits. Press it again to go on; it reads the screen afresh first, so you can answer or scroll yourself meanwhile. |
+| `Ctrl+Alt+S` | Skip the question in view. It is left unanswered and the agent moves on. |
+| `Ctrl+Alt+Q` | Stop. |
+
+A key takes effect within a few seconds, at the agent's next look at the screen or before it clicks Next. Moving the mouse into a screen corner still stops it at once. If another program already uses one of the keys, the agent says so when it starts.
+
+### answers.md
+
+Every question is written to `answers.md` in this folder as the run goes: the options, the one chosen, the reason, how long it took, and whether the click was confirmed on the screen, was left for you or was skipped. A line at the end of each run counts them. Each run is added below the last one, so you can look back over a quiz afterwards and find the questions to check by hand. `--no-log` turns it off.
+
+### The documentation check
+
+Before clicking an answer to an exact-syntax question, the agent looks up the commands in the chosen option. Git flags and commands are checked against Git's own manual, installed with Git (198 pages). `gh` commands are checked against `gh`'s help when `gh` is installed (`winget install GitHub.cli`). GitHub Actions expressions are checked against the list of context properties in GitHub's reference, such as `github.ref`, `runner.os` and `steps.<id>.outcome`. If the chosen option uses something that does not exist, such as `git push --force-safe`, `gh run rerun --only-failed` or `github.branch`, the agent asks the model once more, as text only, and tells it what the documentation says. The model then answers again, which also handles questions that ask which option is invalid. Nothing is sent when the chosen option checks out, which is almost always the case. `--no-doc-check` turns it off.
 
 ## Try it on the demo quiz
 
@@ -102,11 +123,12 @@ The demo quiz shows your score after you press Submit.
 - **A click doesn't register:** after 2 tries on the same question it prints `Could not select the answer to: ...`, leaves that question for you and moves on. It stops only when this happens on two questions in a row, which means clicks are not reaching the page at all (the quiz window is not in front, or something covers it).
 - **A question doesn't fit on the screen:** it scrolls the question's first line to the top of the page area, measuring how far the page really moves rather than assuming, never more than two wheel notches at a time, and landing within half a notch of the target. If the first line is already at the top but the page had been scrolled down on this question, it scrolls back up first, because it has probably scrolled past the question's start. If the options are still cut off after two scrolls, or the page does not scroll at all, it asks you to zoom the browser out (Ctrl and minus) and run again. Every scroll prints a line such as `Scroll: asked 450 px, measured 300 px in 2 wheel event(s), 150 px per notch measured`; `the page did not move` on that line means the wheel is not scrolling this page.
 - **The screen stops changing:** this covers a Next button that does nothing, or no quiz on screen.
-- **You abort:** move the mouse to any corner of the screen.
+- **You abort:** move the mouse to any corner of the screen, or press `Ctrl+Alt+Q`.
 
 ## Good to know
 
-- With every provider except `local`, each screenshot of your whole main screen is sent to that company, so close anything private first.
+- With every provider except `local`, each screenshot of your whole main screen is sent to that company, so close anything private first. `--fast` sends only the quiz's columns after its first read, but that first read is the whole screen.
+- `answers.md` holds the quiz's questions and your answers. Git ignores it, but a copy of the folder carries it along.
 - Keep the quiz visible and don't touch the mouse while it runs. Moving it during a click shifts where the click lands.
 - It only reads your main monitor.
 - Answers can be wrong, especially on image-heavy or very specialized questions.
@@ -115,5 +137,5 @@ The demo quiz shows your score after you press Submit.
 ## Tests
 
 ```powershell
-.venv\Scripts\python -m unittest test_mcq_agent
+.venv\Scripts\python -m unittest test_mcq_agent test_doc_check
 ```

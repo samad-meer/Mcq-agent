@@ -377,31 +377,55 @@ class FakeQuiz:
             self.feedback_shown = self.feedback
 
 
+class ScriptedControls(mcq_agent.Controls):
+    """Keys pressed at given looks at the keyboard: {look number: [events]}."""
+
+    def __init__(self, by_look):
+        super().__init__()
+        self.by_look, self.looks = by_look, 0
+
+    def take(self):
+        self.looks += 1
+        return list(self.by_look.get(self.looks, [])) + super().take()
+
+
 class RunLoopTest(unittest.TestCase):
     """Drives run() with scripted screens, recording clicks instead of performing them."""
 
-    def play(self, reads, max_steps=20, quiz=None, careful=False):
+    def play(self, reads, max_steps=20, quiz=None, careful=False, provider=None, log=None, controls=None, docs=False,
+             on_read=None, sleep=None):
         """Returns the click positions and scroll count; self.calls keeps every screen and mouse call in order.
 
         With a FakeQuiz the screenshots come from it and the clicks land on it; without one there
-        are none, so no click can be confirmed and every page is read twice. self.reads counts the reads.
+        are none, so no click can be confirmed and every page is read twice. self.reads counts the reads,
+        and self.sent holds the size of each picture the model was given. on_read(number, read) runs as
+        each read is handed over, to press a key at that moment; sleep(seconds) runs for every pause.
         """
         reads = iter(reads)
+        self.sent = []
+
+        def reading(client, provider_, image):
+            self.sent.append(image.size if image is not None else None)
+            read = next(reads).model_copy(deep=True)  # the agent may move positions; a read listed twice stays as written
+            if on_read:
+                on_read(len(self.sent), read)
+            return read
+
         self.calls = mock.Mock()
         with (
             mock.patch.object(mcq_agent, "capture", side_effect=quiz.image if quiz else lambda *_: None) as capture,
-            mock.patch.object(mcq_agent, "read_screen", side_effect=lambda *_: next(reads)) as read,
+            mock.patch.object(mcq_agent, "read_screen", side_effect=reading) as read,
             mock.patch.object(mcq_agent, "wobble", STILL),
             mock.patch.dict(mcq_agent.learned, {"per_notch": None}),
             mock.patch.object(mcq_agent, "glide") as glide,
-            mock.patch.object(mcq_agent.time, "sleep") as sleep,
+            mock.patch.object(mcq_agent.time, "sleep", side_effect=sleep) as slept,
             mock.patch.object(mcq_agent.pyautogui, "click", side_effect=quiz.click if quiz else None) as click,
             mock.patch.object(mcq_agent.pyautogui, "scroll") as scroll,
             mock.patch("builtins.print") as printed,
         ):
-            for name, child in [("capture", capture), ("sleep", sleep), ("glide", glide), ("click", click), ("scroll", scroll)]:
+            for name, child in [("capture", capture), ("sleep", slept), ("glide", glide), ("click", click), ("scroll", scroll)]:
                 self.calls.attach_mock(child, name)
-            mcq_agent.run(None, None, None, MONITOR, max_steps, careful=careful)
+            mcq_agent.run(None, provider, None, MONITOR, max_steps, careful=careful, log=log, controls=controls, docs=docs)
         self.printed = " ".join(str(c.args[0]) for c in printed.call_args_list if c.args)
         self.reads = read.call_count
         return [c.args for c in click.call_args_list], scroll.call_count
@@ -882,6 +906,301 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(scrolls, 1)
 
 
+    # --fast: after one whole read, only the quiz's columns go to the model, and positions come back on the screen.
+
+    FAST = mcq_agent.with_fast({"response_format": {"type": "json_schema"}})
+
+    def test_fast_sends_the_whole_width_first_then_only_the_quiz_columns(self):
+        clicks, _ = self.play([
+            next_screen(question("Q1")),
+            next_screen(question("Q2", answers=["A"])),
+            screen(action="finish"),
+            screen(action="finish"),
+        ], quiz=FakeQuiz(), provider=self.FAST)
+        left, right = mcq_agent.quiz_view(next_screen(question("Q1")))
+        self.assertEqual(self.sent[0], (1001, 1001))
+        self.assertEqual(self.sent[1], (round(right / 1000 * 1001) - round(left / 1000 * 1001), 1001))
+        on_screen = lambda x: round(left + x * (right - left) / 1000)
+        self.assertEqual(clicks[:3], [(100, 250), (700, 600), (on_screen(100), 200)])
+
+    def test_fast_reads_the_whole_width_again_when_the_cut_view_shows_no_question(self):
+        self.play([next_screen(question("Q1")), screen(action="finish"), screen(action="finish")],
+                  quiz=FakeQuiz(), provider=self.FAST)
+        self.assertLess(self.sent[1][0], 1001)
+        self.assertEqual(self.sent[2], (1001, 1001))
+
+    def test_fast_gives_a_loading_page_its_moment_before_reading_the_whole_width(self):
+        clicks, _ = self.play([next_screen(question("Q1")), screen(action="none"),
+                               next_screen(question("Q2", answers=["A"])), screen(action="finish"), screen(action="finish")],
+                              quiz=FakeQuiz(), provider=self.FAST)
+        self.assertEqual(self.printed.count("giving the page a moment"), 1)
+        self.assertLess(self.sent[1][0], 1001)  # the empty read was a cut one, and was not repeated at once
+        self.assertEqual(self.sent[2], (1001, 1001))  # the read after the moment looks at the whole width
+        self.assertEqual(clicks[2], (100, 200))  # Q2 read whole, so its position needs no moving
+
+    def test_fast_reads_the_whole_width_again_when_something_touches_a_cut_edge(self):
+        edge = question("Q2", answers=["A"])
+        edge.options[2].position = Point(x=995, y=300)  # at the right edge of the columns sent
+        self.play([next_screen(question("Q1")), next_screen(edge), next_screen(question("Q2", answers=["A"])),
+                   screen(action="finish"), screen(action="finish")], quiz=FakeQuiz(), provider=self.FAST)
+        self.assertLess(self.sent[1][0], 1001)
+        self.assertEqual(self.sent[2], (1001, 1001))
+
+    def test_without_fast_the_whole_screen_is_always_sent(self):
+        self.play([next_screen(question("Q1")), next_screen(question("Q2", answers=["A"])), screen(action="finish")],
+                  quiz=FakeQuiz())
+        self.assertEqual(set(self.sent), {(1001, 1001)})
+
+    # The pause, skip and stop keys.
+
+    def keys_on_read(self, controls, presses):
+        """Press keys as given reads are handed over: {read number: [events]}."""
+        def press(number, read):
+            for event in presses.get(number, []):
+                controls.events.put(event)
+        return press
+
+    def test_stop_key_ends_the_run_before_anything_is_clicked(self):
+        controls = mcq_agent.Controls()
+        clicks, _ = self.play([next_screen(question("Q1"))], controls=controls,
+                              on_read=self.keys_on_read(controls, {1: ["stop"]}))
+        self.assertEqual(clicks, [])
+        self.assertIn("Stopped, as you asked", self.printed)
+
+    def test_skip_key_leaves_the_question_and_moves_on(self):
+        controls = mcq_agent.Controls()
+        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")],
+                              controls=controls, on_read=self.keys_on_read(controls, {1: ["skip"]}))
+        self.assertEqual(clicks, [(700, 600)])  # Next, never the answer
+        self.assertIn("Skipping, as you asked: Q1", self.printed)
+
+    def test_pause_waits_for_the_key_again_then_reads_the_page_afresh(self):
+        controls = mcq_agent.Controls()
+        polls = []
+
+        def pressed_again(seconds):
+            if seconds == mcq_agent.PAUSE_POLL:
+                polls.append(seconds)
+                if len(polls) == 3:
+                    controls.events.put("pause")
+
+        clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1")),
+                               next_screen(question("Q1", selected=["B"])), screen(action="finish")],
+                              controls=controls, on_read=self.keys_on_read(controls, {1: ["pause"]}), sleep=pressed_again)
+        self.assertEqual(len(polls), 3)
+        self.assertIn("Paused", self.printed)
+        self.assertIn("Going on", self.printed)
+        self.assertEqual(clicks, [(100, 250), (700, 600)])  # the read from before the pause was never acted on
+        self.assertEqual(self.reads, 4)
+
+    def test_stop_while_paused_ends_the_run(self):
+        controls = mcq_agent.Controls()
+        clicks, _ = self.play([next_screen(question("Q1"))], controls=controls,
+                              on_read=self.keys_on_read(controls, {1: ["pause"]}),
+                              sleep=lambda s: controls.events.put("stop") if s == mcq_agent.PAUSE_POLL else None)
+        self.assertEqual(clicks, [])
+        self.assertIn("Stopped, as you asked", self.printed)
+
+    def test_pauses_just_before_next_do_not_count_as_the_screen_standing_still(self):
+        # Looks at the keys: 1 and 2 on the first read, 3, 4 and 5 (before Next) on the second, 6, 7 and 8 on the third.
+        controls = ScriptedControls({5: ["pause", "pause"], 8: ["pause", "pause"]})
+        reads = [next_screen(question("Q1"))] + [next_screen(question("Q1", selected=["B"]))] * 3 + [screen(action="finish")]
+        clicks, _ = self.play(reads, controls=controls)
+        self.assertNotIn("stopped changing", self.printed)
+        self.assertEqual(clicks, [(100, 250), (700, 600)])
+
+    # answers.md
+
+    def log_file(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        return os.path.join(folder.name, "answers.md")
+
+    def read_log(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_log_keeps_each_question_its_choice_and_whether_the_click_took(self):
+        path = self.log_file()
+        log = mcq_agent.AnswerLog(path, "test-model")
+        self.play([next_screen(question("Q1")), next_screen(question("Q2", answers=["A"])), screen(action="finish")],
+                  quiz=FakeQuiz(), log=log)
+        text = self.read_log(path)
+        self.assertIn("· test-model", text)
+        self.assertIn("### 1. Q1\n- A. 3\n- **B. 4** ← chosen\n- C. 5", text)
+        self.assertIn("### 2. Q2", text)
+        self.assertIn("Why: Sum.", text)
+        self.assertEqual(text.count(mcq_agent.CONFIRMED), 2 + 1)  # two entries and the summary
+        self.assertIn("**2 question(s):** 2 click confirmed on the screen.", text)
+
+    def test_the_log_says_when_a_question_was_left_for_you(self):
+        path = self.log_file()
+        self.play([next_screen(question("Q1"))] * 3 + [
+            next_screen(question("Q2", answers=["A"])),
+            next_screen(question("Q2", answers=["A"], selected=["A"])),
+            screen(action="finish"),
+        ], quiz=FakeQuiz(registers=False), log=mcq_agent.AnswerLog(path, "m"))
+        self.assertIn(mcq_agent.LEFT, self.read_log(path))
+
+    def test_the_log_records_a_skip(self):
+        path = self.log_file()
+        controls = mcq_agent.Controls()
+        self.play([next_screen(question("Q1")), next_screen(question("Q1")), screen(action="finish")],
+                  controls=controls, log=mcq_agent.AnswerLog(path, "m"), on_read=self.keys_on_read(controls, {1: ["skip"]}))
+        self.assertIn(f"### 1. Q1\n- A. 3\n- B. 4\n- C. 5\n\n{mcq_agent.SKIPPED}", self.read_log(path))
+
+    def test_without_pixels_to_check_the_log_says_the_click_was_not_confirmed(self):
+        path = self.log_file()
+        self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")],
+                  log=mcq_agent.AnswerLog(path, "m"))
+        self.assertIn(mcq_agent.UNCHECKED, self.read_log(path))
+
+    # The documentation check, inside the run.
+
+    def test_a_first_answer_the_documentation_contradicts_is_asked_again_before_clicking(self):
+        path = self.log_file()
+        with (
+            mock.patch.object(mcq_agent.doc_check, "check", return_value={"B": ["`--undo` is not an option of `git commit`"]}),
+            mock.patch.object(mcq_agent, "second_opinion",
+                              return_value=mcq_agent.SecondOpinion(answers=["C"], reason="C is the real flag.")) as asked,
+        ):
+            clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["C"])),
+                                   screen(action="finish")], docs=True, log=mcq_agent.AnswerLog(path, "m"))
+        asked.assert_called_once()
+        self.assertEqual(clicks[0], (100, 300))  # option C
+        text = self.read_log(path)
+        self.assertIn("**C. 5** ← chosen", text)
+        self.assertIn("Doc check: B: `--undo` is not an option of `git commit`", text)
+        self.assertIn("changed from B to C", text)
+
+    def test_findings_against_options_not_chosen_cost_no_second_call(self):
+        with (
+            mock.patch.object(mcq_agent.doc_check, "check", return_value={"A": ["`--x` is not an option"]}),
+            mock.patch.object(mcq_agent, "second_opinion") as asked,
+        ):
+            clicks, _ = self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])),
+                                   screen(action="finish")], docs=True)
+        asked.assert_not_called()
+        self.assertEqual(clicks[0], (100, 250))
+
+    def test_each_question_is_checked_once(self):
+        with mock.patch.object(mcq_agent.doc_check, "check", return_value={}) as check:
+            self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")],
+                      docs=True)
+        self.assertEqual(check.call_count, 1)
+
+
+class QuizViewTest(unittest.TestCase):
+    def read(self, question_x, option_x, control_x=None):
+        q = question(options=("a", "b"))
+        q.position = Point(x=question_x, y=100)
+        for option in q.options:
+            option.position = Point(x=option_x, y=option.position.y)
+        position = Point(x=control_x, y=600) if control_x is not None else None
+        return screen(q, action="next" if position else "none", position=position, label="Next" if position else "")
+
+    def test_a_centred_quiz_keeps_its_columns(self):
+        self.assertEqual(mcq_agent.quiz_view(self.read(500, 400, 500)), (200, 800))
+
+    def test_a_narrow_quiz_still_gets_half_the_screen(self):
+        self.assertEqual(mcq_agent.quiz_view(screen(action="next", position=Point(x=500, y=600), label="Next")), (250, 750))
+
+    def test_a_quiz_across_the_screen_is_not_cut(self):
+        self.assertIsNone(mcq_agent.quiz_view(self.read(500, 100, 950)))
+
+    def test_the_view_only_grows(self):
+        self.assertEqual(mcq_agent.quiz_view(self.read(500, 400, 500), previous=(100, 700)), (100, 800))
+        self.assertEqual(mcq_agent.quiz_view(screen(), previous=(100, 700)), (100, 700))
+
+    def test_positions_move_from_the_cut_picture_onto_the_screen(self):
+        read = self.read(500, 0, 1000)
+        mcq_agent.from_view(read, (200, 800))
+        self.assertEqual(read.questions[0].position, Point(x=500, y=100))
+        self.assertEqual(read.questions[0].options[0].position.x, 200)
+        self.assertEqual(read.navigation.position, Point(x=800, y=600))
+
+    def test_something_at_a_cut_edge_is_noticed_but_not_at_the_screen_edge(self):
+        self.assertTrue(mcq_agent.near_view_edge(self.read(500, 210), (200, 800)))
+        self.assertFalse(mcq_agent.near_view_edge(self.read(500, 5), (0, 800)))
+        self.assertFalse(mcq_agent.near_view_edge(self.read(500, 400), (200, 800)))
+
+
+class AttendTest(unittest.TestCase):
+    def attend(self, events, sleeps=()):
+        controls = mcq_agent.Controls()
+        for event in events:
+            controls.events.put(event)
+        later = iter(sleeps)
+
+        def sleep(seconds):
+            for event in next(later, []):
+                controls.events.put(event)
+
+        with (
+            mock.patch.object(mcq_agent.time, "sleep", side_effect=sleep),
+            mock.patch.object(mcq_agent, "rest_and_settle") as rested,
+            mock.patch("builtins.print"),
+        ):
+            return mcq_agent.attend(controls, MONITOR), rested.call_count
+
+    def test_nothing_pressed(self):
+        self.assertEqual(self.attend([]), (None, 0))
+
+    def test_pause_then_go_on(self):
+        self.assertEqual(self.attend(["pause"], sleeps=[[], ["pause"]]), ("resumed", 1))
+
+    def test_pressed_twice_quickly_goes_straight_on(self):
+        self.assertEqual(self.attend(["pause", "pause"]), ("resumed", 1))
+
+    def test_skip_while_paused_is_kept(self):
+        self.assertEqual(self.attend(["pause"], sleeps=[["skip"], ["pause"]]), ("skip", 1))
+
+    def test_stop_wins(self):
+        self.assertEqual(self.attend(["skip", "stop"]), ("stop", 0))
+
+
+class AnswerLogTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = os.path.join(folder.name, "answers.md")
+
+    def text(self):
+        with open(self.path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_each_question_is_written_once_and_the_summary_once(self):
+        log = mcq_agent.AnswerLog(self.path, "m", fast=True)
+        log.seen("k", question(), ["B"], 2.0, 0)
+        log.done("k", mcq_agent.CONFIRMED)
+        log.done("k", mcq_agent.LEFT)
+        log.finish()
+        log.finish()
+        text = self.text()
+        self.assertIn("· m · --fast", text)
+        self.assertEqual(text.count("### "), 1)
+        self.assertEqual(text.count("question(s):"), 1)
+        self.assertIn("model 2.0 s", text)
+
+    def test_runs_are_added_to_the_same_file(self):
+        mcq_agent.AnswerLog(self.path, "first").finish()
+        mcq_agent.AnswerLog(self.path, "second").finish()
+        self.assertEqual(self.text().count("\n## "), 2)
+
+    def test_no_path_writes_nothing(self):
+        log = mcq_agent.AnswerLog(None)
+        log.seen("k", question(), ["B"], 1.0, 0)
+        log.finish()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_file_that_cannot_be_written_does_not_stop_the_run(self):
+        with mock.patch("builtins.print") as printed:
+            log = mcq_agent.AnswerLog(os.path.join(self.path, "no", "such", "folder.md"), "m")
+            log.seen("k", question(), ["B"], 1.0, 0)
+            log.finish()
+        self.assertIn("not being kept", printed.call_args.args[0])
+
+
 class ChangedElsewhereTest(unittest.TestCase):
     def shot(self, marks=(), size=10):
         image = Image.new("RGB", (MONITOR["width"], MONITOR["height"]), "white")
@@ -1291,6 +1610,82 @@ class ReadScreenTest(unittest.TestCase):
     def test_missing_usage_is_reported_as_unknown(self):
         self.call()
         self.assertIn("tokens unknown", self.printed)
+
+    def fast_reply(self):
+        reply = json.loads(next_screen(question()).model_dump_json())
+        for q in reply["questions"]:
+            del q["reason"]
+        del reply["navigation"]["blank"]
+        return json.dumps(reply)
+
+    def test_fast_asks_for_the_short_reply_and_gives_back_the_full_shape(self):
+        read, expected = self.call(mcq_agent.with_fast(mcq_agent.PROVIDERS["gemini"]), replies=[self.fast_reply()])
+        self.assertEqual(self.body()["messages"][0]["content"], mcq_agent.FAST_SYSTEM_PROMPT)
+        schema = self.body()["response_format"]["json_schema"]["schema"]
+        self.assertNotIn("reason", schema["$defs"]["FastQuestion"]["properties"])
+        self.assertNotIn("blank", schema["$defs"]["FastNavigation"]["properties"])
+        self.assertEqual(read.questions[0].reason, "")
+        self.assertIsNone(read.navigation.blank)
+        self.assertEqual(read.questions[0].answers, expected.questions[0].answers)
+
+    def test_fast_keeps_plain_json_for_providers_without_schemas(self):
+        self.call(mcq_agent.with_fast(mcq_agent.PROVIDERS["groq"]), replies=[self.fast_reply()])
+        self.assertEqual(self.body()["response_format"], {"type": "json_object"})
+
+    def test_fast_still_retries_a_reply_with_no_answer(self):
+        empty = json.loads(self.fast_reply())
+        empty["questions"][0]["answers"] = []
+        read, _ = self.call(mcq_agent.with_fast(mcq_agent.PROVIDERS["gemini"]), replies=[json.dumps(empty), self.fast_reply()])
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(read.questions[0].answers, ["B"])
+
+    def test_the_fast_prompt_keeps_every_rule_but_the_dropped_fields(self):
+        for kept in ("Never Previous or Back".lower(), "whole quiz when it ends", "cut_off: true when", "exact commands"):
+            self.assertIn(kept, mcq_agent.FAST_SYSTEM_PROMPT.lower())
+        for dropped in ("- reason:", "blank is a point"):
+            self.assertNotIn(dropped, mcq_agent.FAST_SYSTEM_PROMPT)
+
+
+class SecondOpinionTest(unittest.TestCase):
+    """Runs second_opinion through the real SDK against a fake HTTP server."""
+
+    def ask(self, reply, status=200, provider="gemini"):
+        self.requests = []
+
+        def handler(request):
+            self.requests.append(request)
+            if status != 200:
+                return httpx2.Response(status, json={"error": {"message": "busy"}})
+            return httpx2.Response(200, json={
+                "id": "c", "object": "chat.completion", "created": 0, "model": "t",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": reply}}],
+            })
+
+        http_client = openai.DefaultHttpxClient(transport=httpx2.MockTransport(handler))
+        client = openai.OpenAI(api_key="t", base_url="https://test.invalid/v1", http_client=http_client, max_retries=0)
+        q = question("Which flag amends the last commit?", options=("git commit --undo", "git commit --amend", "git reset"))
+        with mock.patch("builtins.print"):
+            return mcq_agent.second_opinion(client, mcq_agent.PROVIDERS[provider], q,
+                                            {"A": ["`--undo` is not an option of `git commit` in Git's manual"]})
+
+    def body(self):
+        return json.loads(self.requests[0].content)
+
+    def test_the_findings_go_with_the_question_as_text_only(self):
+        reply = self.ask('{"answers": ["B"], "reason": "--amend exists."}')
+        self.assertEqual(reply.answers, ["B"])
+        user = self.body()["messages"][1]["content"]
+        self.assertIsInstance(user, str)
+        self.assertIn("A. git commit --undo\n   Documentation: `--undo` is not an option", user)
+        self.assertIn("Your first answer: B", user)
+        self.assertEqual(self.body()["response_format"]["json_schema"]["name"], "second_opinion")
+
+    def test_an_answer_that_is_not_an_option_is_ignored(self):
+        self.assertIsNone(self.ask('{"answers": ["Z"], "reason": "?"}'))
+
+    def test_a_failed_call_keeps_the_first_answer_instead_of_stopping(self):
+        self.assertIsNone(self.ask("", status=429))
+        self.assertIsNone(self.ask("not json"))
 
 
 if __name__ == "__main__":

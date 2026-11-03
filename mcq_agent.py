@@ -6,9 +6,11 @@ import io
 import json
 import math
 import os
+import queue
 import random
 import re
 import sys
+import threading
 import time
 from collections import Counter
 from typing import Literal
@@ -24,6 +26,8 @@ import openai
 import pyautogui
 from PIL import Image, ImageChops, ImageDraw
 from pydantic import BaseModel, ValidationError, model_validator
+
+import doc_check
 
 pyautogui.PAUSE = 0.02  # the default 0.1 s after every move and click adds up; the agent paces itself
 
@@ -72,6 +76,21 @@ learned = {"per_notch": None}  # pixels one wheel notch moves the page, once mea
 DEBUG_IMAGE = "last_read.jpg"
 DEBUG_FOLDER = "reads"  # --debug saves every screenshot read here
 KEYS_FILE = ".env"  # API keys, one NAME=value line each, next to this script
+ANSWERS_FILE = "answers.md"  # every question answered, with the choice, the reason and whether the click took
+# --fast: the share of the screen's width kept around what a read placed, in grid units.
+QUESTION_REACH = 300  # either side of a question's first line, which the model gives as the line's centre
+OPTION_REACH = (50, 350)  # left and right of an option's button: its words run to the right
+CONTROL_REACH = 80  # either side of a Next or Submit button
+MIN_VIEW = 500  # never narrower than half the screen
+FULL_VIEW = 850  # wider than this is not worth cutting
+VIEW_EDGE = 20  # a position this close to a cut edge may belong to something cut off, so the next read is whole
+PAUSE_POLL = 0.2  # s between looks at the keyboard while paused
+MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, WM_HOTKEY = 0x1, 0x2, 0x4000, 0x0312
+HOTKEYS = {  # what each key does, its name, and its Windows modifiers and virtual key
+    "pause": ("Ctrl+Alt+P", MOD_CONTROL | MOD_ALT, ord("P")),
+    "skip": ("Ctrl+Alt+S", MOD_CONTROL | MOD_ALT, ord("S")),
+    "stop": ("Ctrl+Alt+Q", MOD_CONTROL | MOD_ALT, ord("Q")),
+}
 # Button labels, in several languages, that end or grade the whole quiz rather than one question.
 ENDS_QUIZ = re.compile(
     r"\b(quiz\w*|tests?|exam\w*|finish\w*|end|complet\w*|all|done|results?|score|grade|assess\w*|assign\w*|form|"
@@ -106,13 +125,17 @@ class Question(BaseModel):
 
     @model_validator(mode="after")
     def answers_are_shown_options(self):
-        """A read with no usable answer is a bad read: accepting it would skip the question for good."""
-        if self.cut_off:
-            return self  # the right option may be a hidden one, so no answer is expected yet
-        labels = {option.label for option in self.options}
-        if not self.answers or not labels.issuperset(self.answers):
-            raise ValueError("answers must be labels of the options shown")
-        return self
+        return check_answers(self)
+
+
+def check_answers(question):
+    """A read with no usable answer is a bad read: accepting it would skip the question for good."""
+    if question.cut_off:
+        return question  # the right option may be a hidden one, so no answer is expected yet
+    labels = {option.label for option in question.options}
+    if not question.answers or not labels.issuperset(question.answers):
+        raise ValueError("answers must be labels of the options shown")
+    return question
 
 
 class Navigation(BaseModel):
@@ -127,6 +150,45 @@ class Navigation(BaseModel):
 class ScreenRead(BaseModel):
     questions: list[Question]
     navigation: Navigation
+
+
+# --fast asks for less: no reason and no resting spot, and shortened texts. Everything the
+# safety rules read is still there, and a read is turned into the full shape at once.
+class FastQuestion(BaseModel):
+    text: str
+    position: Point
+    options: list[Option]
+    answers: list[str]
+    selected: list[str]
+    cut_off: bool
+
+    @model_validator(mode="after")
+    def answers_are_shown_options(self):
+        return check_answers(self)
+
+
+class FastNavigation(BaseModel):
+    action: Literal["next", "submit", "scroll", "finish", "none"]
+    position: Point | None
+    label: str
+    records: Literal["this question", "whole quiz", "unknown"]
+    remaining: Literal["more", "last", "unknown"]
+
+
+class FastRead(BaseModel):
+    questions: list[FastQuestion]
+    navigation: FastNavigation
+
+    def full(self) -> ScreenRead:
+        return ScreenRead(
+            questions=[Question(**q.model_dump(), reason="") for q in self.questions],
+            navigation=Navigation(**self.navigation.model_dump(), blank=None),
+        )
+
+
+class SecondOpinion(BaseModel):
+    answers: list[str]
+    reason: str
 
 
 class AgentStop(Exception):
@@ -195,6 +257,45 @@ SCHEMA_FORMAT = {
     "type": "json_schema",
     "json_schema": {"name": "screen_read", "schema": SCHEMA, "strict": True},
 }
+
+
+def shortened(prompt, changes):
+    """The prompt with each (old, new) change made; every old text has to be there, so the two prompts cannot drift apart."""
+    for old, new in changes:
+        if old not in prompt:
+            raise RuntimeError(f"The prompt no longer contains: {old!r}")
+        prompt = prompt.replace(old, new)
+    return prompt
+
+
+FAST_SCHEMA = FastRead.model_json_schema()
+FAST_SYSTEM_PROMPT = shortened(SYSTEM_PROMPT.split("Reply with only JSON")[0], [
+    ("- text: the question as written.", "- text: the first 12 words of the question, exactly as written."),
+    ("position is the center of the option's radio button, checkbox or clickable card.",
+     "position is the center of the option's radio button, checkbox or clickable card. text is the "
+     "option's first 8 words, or all of it when it is a command or code."),
+    ("- reason: one sentence on why the answer is correct.\n", ""),
+    ("blank is a point on empty page background at least 100 px from every option, button and link, "
+     "where the mouse can rest without touching anything, or null if there is none.\n", ""),
+]) + "Reply with only JSON matching this schema:\n" + json.dumps(FAST_SCHEMA)
+FAST_SCHEMA_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "screen_read", "schema": FAST_SCHEMA, "strict": True},
+}
+SECOND_OPINION_SCHEMA = SecondOpinion.model_json_schema()
+SECOND_OPINION_PROMPT = """\
+You answered a multiple-choice question about exact command or workflow syntax. A check \
+against the documentation installed on this computer, or GitHub's own reference, found \
+problems in some options. Treat these findings as facts: an option they mention uses \
+something that does not exist.
+
+Answer the question again. If it asks for the correct or valid option, choose one the findings \
+do not mention unless every option is mentioned. If it asks which option is wrong, invalid or \
+does not exist, the findings point to it. answers are the labels of the right options; reason \
+is one sentence.
+
+Reply with only JSON matching this schema:
+""" + json.dumps(SECOND_OPINION_SCHEMA)
 
 # All five speak the same API. Each uses the settings its own docs show working with images.
 PROVIDERS = {
@@ -510,6 +611,59 @@ def reusable(read):
     return action == "scroll"
 
 
+def quiz_view(read, previous=None):
+    """The columns of the screen that hold the quiz, as (left, right) in grid units, or None for the whole width.
+
+    Only the width is cut. The full height stays, so a question cut off at the bottom, the
+    scroll targets and the browser's bars mean what they always did. The view only grows:
+    a later question that reaches further widens it.
+    """
+    spans = [(q.position.x - QUESTION_REACH, q.position.x + QUESTION_REACH) for q in read.questions]
+    spans += [(o.position.x - OPTION_REACH[0], o.position.x + OPTION_REACH[1]) for q in read.questions for o in q.options]
+    if read.navigation.position:
+        spans.append((read.navigation.position.x - CONTROL_REACH, read.navigation.position.x + CONTROL_REACH))
+    if not spans:
+        return previous
+    left, right = min(a for a, _ in spans), max(b for _, b in spans)
+    if previous:
+        left, right = min(left, previous[0]), max(right, previous[1])
+    if right - left < MIN_VIEW:
+        middle = (left + right) / 2
+        left, right = middle - MIN_VIEW / 2, middle + MIN_VIEW / 2
+    left, right = max(0, round(left)), min(GRID, round(right))
+    return None if right - left > FULL_VIEW else (left, right)
+
+
+def view_box(view, image):
+    """The pixels of a screenshot inside a view."""
+    return (round(view[0] / GRID * image.width), 0, round(view[1] / GRID * image.width), image.height)
+
+
+def from_view(read, view):
+    """A read of a cut screenshot, with every position moved onto the whole screen's grid."""
+    left, right = view
+
+    def moved(point):
+        return Point(x=round(left + point.x * (right - left) / GRID), y=point.y) if point else point
+
+    for question in read.questions:
+        question.position = moved(question.position)
+        for option in question.options:
+            option.position = moved(option.position)
+    read.navigation.position = moved(read.navigation.position)
+    read.navigation.blank = moved(read.navigation.blank)
+    return read
+
+
+def near_view_edge(read, view):
+    """True when something the model placed sits at a cut edge, where what it belongs to may be cut off."""
+    left, right = view
+    points = [q.position for q in read.questions] + [o.position for q in read.questions for o in q.options]
+    if read.navigation.position:
+        points.append(read.navigation.position)
+    return any((left > 0 and p.x - left < VIEW_EDGE) or (right < GRID and right - p.x < VIEW_EDGE) for p in points)
+
+
 def row_profile(image):
     """Brightness per group of four rows down the middle of the screen, used to tell how far the page moved.
 
@@ -676,21 +830,37 @@ def describe_usage(usage):
     return f"tokens in {usage.prompt_tokens} / out {usage.completion_tokens} / thinking {'?' if thinking is None else thinking}"
 
 
+def with_fast(provider):
+    """The provider settings for --fast: a shorter reply and a smaller picture."""
+    return {**provider, "fast": True}
+
+
+def reply_format(provider, schema_format):
+    """A schema the provider enforces, or plain JSON for providers that only take that."""
+    return schema_format if provider["response_format"].get("type") == "json_schema" else provider["response_format"]
+
+
 def read_screen(client, provider, image):
+    fast = provider.get("fast", False)
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=90, subsampling=0)
+    if fast:
+        image.save(buffer, format="JPEG", quality=85)  # about a third smaller, with no visible loss on screen text
+    else:
+        image.save(buffer, format="JPEG", quality=90, subsampling=0)
     data = base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
     image_url = {"url": f"data:image/jpeg;base64,{data}", **provider.get("image_options", {})}
     extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
+    prompt, shape = (FAST_SYSTEM_PROMPT, FastRead) if fast else (SYSTEM_PROMPT, ScreenRead)
+    response_format = reply_format(provider, FAST_SCHEMA_FORMAT) if fast else provider["response_format"]
 
     problem = "no reply"
     for _ in range(MAX_READ_TRIES):
         started = time.perf_counter()
         response = client.chat.completions.create(
             model=provider["model"],
-            response_format=provider["response_format"],
+            response_format=response_format,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": [
                     {"type": "image_url", "image_url": image_url},
                     {"type": "text", "text": "Read this screenshot."},
@@ -705,12 +875,74 @@ def read_screen(client, provider, image):
         if choice.finish_reason == "length":
             raise AgentStop("The model ran out of output tokens before finishing.")
         try:
-            return ScreenRead.model_validate_json(choice.message.content or "")
+            read = shape.model_validate_json(choice.message.content or "")
         except ValidationError as e:
             first = e.errors()[0]
             where = ".".join(str(part) for part in first["loc"]) or "reply"
             problem = f"{where}: {first['msg']}"
+            continue
+        return read.full() if fast else read
     raise AgentStop(f"The model did not return a valid reading of the screen ({problem}).")
+
+
+def second_opinion(client, provider, question, findings):
+    """Ask the model again, with what the documentation says about the options; None when that fails.
+
+    Only the words go: the question was read already, and the answer is a matter of syntax.
+    A failure here never stops the run; the first answer stands.
+    """
+    lines = [f"Question: {question.text}", "", "Options:"]
+    for option in question.options:
+        lines.append(f"{option.label}. {option.text}")
+        lines.extend(f"   Documentation: {note}" for note in findings.get(option.label, []))
+    lines += ["", f"Your first answer: {', '.join(question.answers)}"]
+    extra = {"reasoning_effort": provider["reasoning_effort"]} if provider.get("reasoning_effort") else {}
+    try:
+        started = time.perf_counter()
+        response = client.chat.completions.create(
+            model=provider["model"],
+            response_format=reply_format(provider, {
+                "type": "json_schema",
+                "json_schema": {"name": "second_opinion", "schema": SECOND_OPINION_SCHEMA, "strict": True},
+            }),
+            messages=[
+                {"role": "system", "content": SECOND_OPINION_PROMPT},
+                {"role": "user", "content": "\n".join(lines)},
+            ],
+            **extra,
+        )
+        print(f"   Model, second opinion: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
+        reply = SecondOpinion.model_validate_json(response.choices[0].message.content or "")
+    except (openai.APIError, ValidationError, IndexError) as e:
+        print(f"   The second opinion failed ({type(e).__name__}), so the first answer stands.")
+        return None
+    labels = {option.label for option in question.options}
+    if not reply.answers or not labels.issuperset(reply.answers):
+        print("   The second opinion named no option shown, so the first answer stands.")
+        return None
+    return reply
+
+
+def check_documentation(client, provider, question):
+    """Look up a first answer's commands in the documentation; when it uses something that does
+    not exist, ask the model again. Changes the question's answers in place; returns notes for the log."""
+    findings = doc_check.check(question)
+    against = {label: notes for label, notes in findings.items() if label in question.answers}
+    if not against:
+        return []
+    notes = [f"{label}: {note}" for label, items in against.items() for note in items]
+    for note in notes:
+        print(f"   Doc check: {note}")
+    reply = second_opinion(client, provider, question, findings)
+    if reply is None:
+        return notes + ["the second opinion failed; the first answer was kept"]
+    if sorted(reply.answers) == sorted(question.answers):
+        print(f"   Asked again with that; the answer stays {', '.join(reply.answers)}.")
+        return notes + [f"asked again; the answer stayed {', '.join(reply.answers)}: {reply.reason}"]
+    print(f"   Asked again with that; the answer is now {', '.join(reply.answers)}: {reply.reason}")
+    first = ", ".join(question.answers)
+    question.answers, question.reason = reply.answers, reply.reason
+    return notes + [f"asked again; the answer changed from {first} to {', '.join(reply.answers)}: {reply.reason}"]
 
 
 def normalize(text, numbered=False):
@@ -854,10 +1086,177 @@ def print_question(question, answers):
         print(f"   Why: {question.reason}")
 
 
-def save_debug_image(image, read, path=None):
-    """Draw the positions the model chose, to check them by eye before trusting clicks."""
+CONFIRMED = "click confirmed on the screen"
+UNCHECKED = "clicked; not confirmed on the screen"
+LEFT = "clicks did not take, so it was left for you"
+SKIPPED = "skipped by you"
+MARKED = "already marked on the page, so not clicked"
+
+
+class AnswerLog:
+    """answers.md: each question, the option chosen and why, how long it took, and whether the click took.
+
+    Written as the run goes, one question at a time, so an abort keeps everything done so far.
+    A path of None writes nothing.
+    """
+
+    def __init__(self, path, model="", fast=False):
+        self.path = path
+        self.open = {}  # question key -> what is known so far, until its outcome is
+        self.written = set()
+        self.outcomes = Counter()
+        self.number = 0
+        self.finished = False
+        self._write(f"\n## {time.strftime('%d %b %Y, %H:%M')} · {model}{' · --fast' if fast else ''}\n")
+
+    def _write(self, text):
+        if self.path is None:
+            return
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            print(f"   Could not write {self.path} ({e}), so the answers are not being kept.")
+            self.path = None
+
+    def seen(self, key, question, answers, model_seconds, started):
+        if key not in self.open and key not in self.written:
+            self.open[key] = {"question": question, "answers": list(answers), "model": model_seconds,
+                              "started": started, "notes": []}
+
+    def note(self, key, notes):
+        if key in self.open:
+            self.open[key]["notes"].extend(notes)
+
+    def done(self, key, outcome, question=None):
+        """Write one question's entry, once; a question never seen as decided needs `question`."""
+        if key in self.written:
+            return
+        entry = self.open.pop(key, None)
+        if entry is None:
+            if question is None:
+                return
+            entry = {"question": question, "answers": [], "model": None, "started": None, "notes": []}
+        self.written.add(key)
+        self.outcomes[outcome] += 1
+        self.number += 1
+        question = entry["question"]
+        lines = [f"### {self.number}. {question.text}"]
+        for option in question.options:
+            chosen = option.label in entry["answers"]
+            lines.append(f"- **{option.label}. {option.text}** ← chosen" if chosen else f"- {option.label}. {option.text}")
+        lines.append("")
+        if question.reason and entry["answers"]:
+            lines.append(f"Why: {question.reason}  ")
+        lines.extend(f"Doc check: {note}  " for note in entry["notes"])
+        timing = [f"model {entry['model']:.1f} s"] if entry["model"] is not None else []
+        if entry["started"] is not None:
+            timing.append(f"{time.monotonic() - entry['started']:.1f} s on this question")
+        lines.append(" · ".join(timing + [outcome]))
+        self._write("\n" + "\n".join(lines) + "\n")
+
+    def close_open(self, outcome=UNCHECKED):
+        for key in list(self.open):
+            self.done(key, outcome)
+
+    def finish(self):
+        if self.finished:
+            return
+        self.finished = True
+        self.close_open()
+        if self.number:
+            parts = ", ".join(f"{count} {outcome}" for outcome, count in self.outcomes.most_common())
+            self._write(f"\n**{self.number} question(s):** {parts}.\n")
+
+
+class Controls:
+    """Keys that work from any window: pause and go on, skip the question in view, stop.
+
+    They are registered with Windows as hot keys, so the quiz page never receives them.
+    """
+
+    def __init__(self):
+        self.events = queue.SimpleQueue()
+        self.taken = []  # keys another program already uses
+
+    def start(self):
+        """Register the keys; returns a line saying which ones work."""
+        if sys.platform != "win32":
+            return "Keyboard control works on Windows only. Move the mouse to a corner of the screen to stop."
+        ready = threading.Event()
+        threading.Thread(target=self._listen, args=(ready,), daemon=True).start()
+        ready.wait(2)
+        uses = {"pause": "pauses and goes on", "skip": "skips the question in view", "stop": "stops"}
+        working = [f"{HOTKEYS[name][0]} {uses[name]}" for name in HOTKEYS if name not in self.taken]
+        line = f"Keys: {', '.join(working)}." if working else "No keys could be registered."
+        if self.taken:
+            line += f" ({', '.join(HOTKEYS[name][0] for name in self.taken)} is used by another program.)"
+        return line
+
+    def _listen(self, ready):
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+        names = {}
+        for number, (name, (_, modifiers, key)) in enumerate(HOTKEYS.items(), 1):
+            if user32.RegisterHotKey(None, number, modifiers | MOD_NOREPEAT, key):
+                names[number] = name
+            else:
+                self.taken.append(name)
+        self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        ready.set()
+        message = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+            if message.message == WM_HOTKEY and message.wParam in names:
+                self.events.put(names[message.wParam])
+
+    def take(self):
+        """The keys pressed since the last call, in order."""
+        events = []
+        while True:
+            try:
+                events.append(self.events.get_nowait())
+            except queue.Empty:
+                return events
+
+
+def attend(controls, monitor):
+    """Act on the keys pressed since the last look: wait out a pause, report a skip or a stop.
+
+    Returns "stop", "skip", "resumed" (the screen read before the pause is out of date) or None.
+    """
+    outcome, paused = None, False
+    pending = controls.take()
+    while pending or paused:
+        if not pending:
+            time.sleep(PAUSE_POLL)
+            pending = controls.take()
+            continue
+        event = pending.pop(0)
+        if event == "stop":
+            return "stop"
+        if event == "skip":
+            outcome = "skip"
+        elif event == "pause":
+            paused = not paused
+            if paused:
+                print(f"\nPaused. Press {HOTKEYS['pause'][0]} to go on, or {HOTKEYS['stop'][0]} to stop.")
+            else:
+                print("Going on.")
+                rest_and_settle(monitor)  # the mouse and the page may both have moved meanwhile
+                outcome = outcome or "resumed"
+    return outcome
+
+
+def save_debug_image(image, read, path=None, view=None):
+    """Draw the positions the model chose, to check them by eye before trusting clicks.
+
+    With --fast, two blue lines mark the columns that were sent to the model.
+    """
     marked = image.copy()
     draw = ImageDraw.Draw(marked)
+    if view:
+        for edge in view_box(view, image)[0::2]:
+            draw.line((edge, 0, edge, image.height), fill="blue", width=3)
     targets = [o.position for q in read.questions for o in q.options if o.label in q.answers]
     if read.navigation.position:
         targets.append(read.navigation.position)
@@ -890,7 +1289,7 @@ def dry_run(client, provider, sct, monitor):
         print("The mouse is resting on the last answer.")
 
 
-def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
+def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, log=None, controls=None, docs=False):
     """Work through the quiz, one fresh screenshot per action.
 
     Nothing acts on a stale screen: before anything is clicked, the part of the screen the
@@ -900,7 +1299,35 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
     which option is marked. Once every click on a page is confirmed that way and nothing
     else on the page moved, the Next, Submit or scroll the model already found is followed
     without reading the page again; `careful` asks for that second read every time.
+
+    `log` keeps each question in answers.md, `controls` are the pause, skip and stop keys,
+    and `docs` looks up the commands in a first answer before it is clicked. With a --fast
+    provider only the quiz's columns of the screen are sent, once a read has shown where they are.
     """
+    log = log or AnswerLog(None)
+    controls = controls or Controls()
+    fast = bool(provider and provider.get("fast"))
+    view = None  # --fast: the columns sent to the model, once a read has placed the quiz
+    whole = False  # --fast: send the whole width on the next read
+    skipped = set()  # questions the person asked to skip
+    skipped_fits = set()  # the same, for questions cut off at the bottom
+    doc_notes = {}
+    last_read = None
+
+    def skip(read):
+        names = []
+        for question in read.questions:
+            if question.cut_off:
+                skipped_fits.add(normalize(question.text, numbered=True))
+            else:
+                key = key_of(question, decided, submitted | given_up | skipped)
+                if key in submitted or key in given_up or key in skipped:
+                    continue
+                skipped.add(key)
+                log.done(key, SKIPPED, question)
+            names.append(question.text)
+        print(f"\nSkipping, as you asked: {'; '.join(names)}" if names else "\nThere was no question to skip.")
+
     decided = {}
     attempts = Counter()
     verified = {}  # question key -> labels whose click visibly changed the option
@@ -922,10 +1349,41 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
 
     rest_and_settle(monitor)
     for step in range(max_steps):
+        wish = attend(controls, monitor)
+        if wish == "stop":
+            print("\nStopped, as you asked.")
+            break
+        if wish == "skip" and last_read is not None:
+            skip(last_read)
         image = capture(sct, monitor)
-        read = read_screen(client, provider, image)
+        cut = view if fast and image is not None and not whole else None
+        started = time.monotonic()
+        read = read_screen(client, provider, image.crop(view_box(cut, image)) if cut else image)
+        seconds = time.monotonic() - started
+        if cut:
+            from_view(read, cut)
         if debug and image is not None:
-            save_debug_image(image, read, os.path.join(DEBUG_FOLDER, f"read-{step + 1:03d}.jpg"))
+            save_debug_image(image, read, os.path.join(DEBUG_FOLDER, f"read-{step + 1:03d}.jpg"), cut)
+        wish = attend(controls, monitor)
+        if wish == "stop":
+            print("\nStopped, as you asked.")
+            break
+        if wish:
+            if wish == "skip":
+                skip(read)
+            continue  # after a pause or a skip, this read is out of date
+        last_read = read
+        acts = intended_action(read.navigation) not in ("scroll", "none")
+        if cut and (near_view_edge(read, cut) or (not read.questions and acts)):
+            # The quiz may reach past the columns sent, and a Next followed now could skip a
+            # question outside them: look at the whole width before doing anything.
+            whole = True
+            continue
+        if fast and image is not None:
+            if read.questions:
+                view, whole = quiz_view(read, view), False
+            else:
+                whole = True  # a page still loading gets its usual moment, then a whole-width read
         navigation = read.navigation
         blank = navigation.blank
 
@@ -938,6 +1396,8 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             continue
         stale = 0
 
+        if pending_fit is not None and pending_fit[0] in skipped_fits:
+            pending_fit = None
         if pending_fit is not None:
             key, recoveries = pending_fit
             if any(within(normalize(q.text, numbered=True), key) for q in read.questions):
@@ -952,8 +1412,22 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             else:
                 pending_fit = None
 
-        done = submitted | given_up
+        done = submitted | given_up | skipped
+        if docs:
+            for question in read.questions:
+                key = key_of(question, decided, done)
+                if not question.cut_off and key not in decided and key not in done:
+                    doc_notes[key] = check_documentation(client, provider, question)
+        before = set(decided)
         pending = pending_clicks(read, decided, done, verified)
+        clicking = {key_of(q, decided, done) for q, _ in pending}
+        for question in read.questions:
+            key = key_of(question, decided, done)
+            if not question.cut_off and key in decided and key not in before:
+                log.seen(key, question, decided[key], seconds, started)
+                log.note(key, doc_notes.get(key, []))
+                if key not in clicking:
+                    log.done(key, MARKED)
         keys = {key_of(q, decided, done) for q in read.questions if not q.cut_off}
         if any(attempts[key] for key in keys - {key_of(q, decided, done) for q, _ in pending} - given_up):
             failed = 0  # a click made earlier shows as registered now
@@ -963,6 +1437,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
             key = key_of(question, decided, done)
             if attempts[key] >= MAX_ATTEMPTS:
                 given_up.add(key)
+                log.done(key, LEFT)
                 gave_up = True
                 answered -= 1
                 failed += 1
@@ -989,6 +1464,9 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
                     if changed_pixels(before, after.crop(strip)) >= CLICK_PIXELS:
                         verified.setdefault(key, set()).add(option.label)
                         failed = 0
+                for key in {key for key, _, _, _ in clicked}:
+                    if all(option.label in verified.get(key, ()) for k, option, _, _ in clicked if k == key):
+                        log.done(key, CONFIRMED)
                 # Every click took and nothing else on the page moved, so the control the model
                 # found is still where it was: no need to read the page again before following it.
                 confirmed = (not careful and not gave_up and reusable(read)
@@ -999,7 +1477,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
                 continue
             fresh = after
 
-        cut_off = [q for q in read.questions if q.cut_off]
+        cut_off = [q for q in read.questions if q.cut_off and normalize(q.text, numbered=True) not in skipped_fits]
         if cut_off:
             question = cut_off[0]
             key = normalize(question.text, numbered=True)  # the full key would change as more options come into view
@@ -1058,12 +1536,24 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
         if action == "finish":
             print("\nThat was the last question. Review your answers and submit the quiz yourself.")
             break
+        if action in ("submit", "next"):
+            wish = attend(controls, monitor)  # the last chance before the page moves on
+            if wish == "stop":
+                print("\nStopped, as you asked.")
+                break
+            if wish:
+                if wish == "skip":
+                    skip(read)
+                last_state = None  # the next read of this page is not the screen standing still
+                continue
         if action == "submit" and navigation.position:
             submitted.update(key_of(q, decided, done) for q in owner_of(navigation.position, read.questions))
             click(navigation.position, monitor, blank)
+            log.close_open()
         elif action == "next" and navigation.position:
             left.update(seen)
             click(navigation.position, monitor)  # the page is about to change, so its blank spot is not used
+            log.close_open()
         elif action == "scroll":
             pixels = SCROLL_FRACTION * monitor["height"]
             moved = scroll_page(sct, monitor, pixels)  # waits for the page to settle itself
@@ -1081,6 +1571,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False):
     else:
         print(f"\nStopped after {max_steps} steps.")
 
+    log.finish()
     print(f"Answered {answered} question(s).")
 
 
@@ -1097,6 +1588,12 @@ def main():
                         help=f"save every screenshot read, with the click targets drawn, in the {DEBUG_FOLDER} folder")
     parser.add_argument("--careful", action="store_true",
                         help="read the screen again after every answer click before moving on: slower, safest on a new site")
+    parser.add_argument("--fast", action="store_true",
+                        help="a shorter reply (no reason, shortened texts) and only the quiz's part of the screen: "
+                             "faster and cheaper reads")
+    parser.add_argument("--no-log", action="store_true", help=f"do not write the answers to {ANSWERS_FILE}")
+    parser.add_argument("--no-doc-check", action="store_true",
+                        help="do not look up git, gh and GitHub Actions syntax in the documentation")
     parser.add_argument("--save-key", metavar="KEY", help=f"save this API key for the chosen provider in {KEYS_FILE} and exit")
     parser.add_argument("--check-key", action="store_true",
                         help="say where the chosen provider's key comes from and exit; exit code 1 when there is none")
@@ -1124,11 +1621,24 @@ def main():
         print(f"{provider['key_env']} found in {source}.")
         return
 
+    log = None
     try:
         if args.effort:
             provider = with_effort(provider, args.effort)
+        if args.fast:
+            provider = with_fast(provider)
         client = make_client(provider)
-        print(f"Using {provider['model']}. Starting in {args.delay:g}s. Switch to the quiz. Move the mouse to a screen corner to abort.")
+        print(f"Using {provider['model']}{' with --fast' if args.fast else ''}. Starting in {args.delay:g}s. "
+              "Switch to the quiz. Move the mouse to a screen corner to abort.")
+        if not args.dry_run:
+            controls = Controls()
+            print(controls.start())
+            if not args.no_doc_check:
+                print(doc_check.describe())
+            if not args.no_log:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ANSWERS_FILE)
+                log = AnswerLog(path, provider["model"], args.fast)
+                print(f"Answers are written to {ANSWERS_FILE}.")
         started = time.monotonic()
         warm_up(client, provider)
         time.sleep(max(0.0, args.delay - (time.monotonic() - started)))
@@ -1140,7 +1650,8 @@ def main():
             if args.dry_run:
                 dry_run(client, provider, sct, monitor)
             else:
-                run(client, provider, sct, monitor, args.max_steps, args.debug, args.careful)
+                run(client, provider, sct, monitor, args.max_steps, args.debug, args.careful,
+                    log=log, controls=controls, docs=not args.no_doc_check)
     except AgentStop as e:
         sys.exit(f"\nStopped: {e}")
     except pyautogui.FailSafeException:
@@ -1157,6 +1668,9 @@ def main():
         sys.exit(f"API error ({e.status_code}): {e.message}{detail}")
     except openai.APIConnectionError:
         sys.exit(f"Could not reach {provider['base_url']}. {hint}")
+    finally:
+        if log is not None:
+            log.finish()  # questions still open are written, whatever ended the run
 
 
 if __name__ == "__main__":
