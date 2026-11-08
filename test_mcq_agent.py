@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import socket
 import tempfile
 import unittest
 from collections import Counter
@@ -1887,6 +1888,46 @@ class SecondOpinionTest(unittest.TestCase):
     def test_a_failed_call_keeps_the_first_answer_instead_of_stopping(self):
         self.assertIsNone(self.ask("", status=429))
         self.assertIsNone(self.ask("not json"))
+
+
+class PreferIpv4Test(unittest.TestCase):
+    V6 = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0)),
+          (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::2", 443, 0, 0))]
+    V4 = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+          (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 443))]
+
+    @staticmethod
+    def lookup(answer):
+        """A stand-in for socket.getaddrinfo; a plain function, because a Mock has every attribute."""
+        def getaddrinfo(*args, **kwargs):
+            getaddrinfo.calls.append((args, kwargs))
+            return list(answer)
+        getaddrinfo.calls = []
+        return getaddrinfo
+
+    def test_ipv4_addresses_are_tried_first_and_ipv6_stays_as_a_fallback(self):
+        lookup = self.lookup(self.V6 + self.V4)
+        with mock.patch("socket.getaddrinfo", lookup):
+            mcq_agent.prefer_ipv4()
+            self.assertEqual(socket.getaddrinfo("example.com", 443), self.V4 + self.V6)
+        self.assertEqual(lookup.calls, [(("example.com", 443), {})])
+
+    def test_an_ipv6_only_answer_is_left_alone(self):
+        with mock.patch("socket.getaddrinfo", self.lookup(self.V6)):
+            mcq_agent.prefer_ipv4()
+            self.assertEqual(socket.getaddrinfo("example.com", 443), self.V6)
+
+    def test_a_second_call_does_not_wrap_the_lookup_twice(self):
+        lookup = self.lookup(self.V6 + self.V4)
+        with mock.patch("socket.getaddrinfo", lookup):
+            mcq_agent.prefer_ipv4()
+            first = socket.getaddrinfo
+            mcq_agent.prefer_ipv4()
+            self.assertIs(socket.getaddrinfo, first)
+            self.assertIs(first.ipv4_first_of, lookup)
+
+    def test_the_real_lookup_is_back_after_each_test(self):
+        self.assertFalse(hasattr(socket.getaddrinfo, "ipv4_first_of"))
 
 
 if __name__ == "__main__":

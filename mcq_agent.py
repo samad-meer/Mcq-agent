@@ -9,6 +9,7 @@ import os
 import queue
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -457,6 +458,25 @@ def make_client(provider):
             raise AgentStop(f"No Gemini API key found. Run setup.bat, or put GEMINI_API_KEY=your-key in {KEYS_FILE} next to mcq_agent.py.")
         raise AgentStop(f"No API key found. Put {key_env}=your-key in {KEYS_FILE} next to mcq_agent.py.")
     return openai.OpenAI(base_url=provider["base_url"], api_key=key, max_retries=MAX_API_RETRIES)
+
+
+def prefer_ipv4():
+    """Have this process try a host's IPv4 addresses before its IPv6 ones.
+
+    Some networks give the PC an IPv6 address that reaches nothing. Windows still lists IPv6
+    first, and each dead address waits out the 5-second connect timeout before the next is
+    tried: measured on such a network, every new connection to Gemini took 40.7 s instead of
+    0.6 s, so the agent looked stuck after a click. IPv6 is still tried when IPv4 fails.
+    """
+    system = socket.getaddrinfo
+    if getattr(system, "ipv4_first_of", None):
+        return
+
+    def ipv4_first(*args, **kwargs):
+        return sorted(system(*args, **kwargs), key=lambda info: info[0] != socket.AF_INET)
+
+    ipv4_first.ipv4_first_of = system
+    socket.getaddrinfo = ipv4_first
 
 
 def with_effort(provider, level):
@@ -1739,6 +1759,7 @@ def main():
     parser.add_argument("--check-key", action="store_true",
                         help="say where the chosen provider's key comes from and exit; exit code 1 when there is none")
     args = parser.parse_args()
+    prefer_ipv4()
 
     provider = dict(PROVIDERS[args.provider])
     if args.model:
