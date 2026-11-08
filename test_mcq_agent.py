@@ -1,9 +1,11 @@
 import json
+import logging
 import math
 import os
 import random
 import socket
 import tempfile
+import time
 import unittest
 from collections import Counter
 from unittest import mock
@@ -474,6 +476,32 @@ class RunLoopTest(unittest.TestCase):
         glides = [c for c in self.calls.mock_calls if c[0] == "glide"]
         self.assertEqual(glides[2], mock.call.glide(800, 700, MONITOR, pace=1.3))  # after the option click
         self.assertEqual(glides[4], mock.call.glide(REST_X, 600, MONITOR, pace=1.3))  # after Next: the page changes
+
+    def test_after_the_last_answer_click_the_mouse_parks_on_next_when_the_read_can_be_followed(self):
+        self.play([next_screen(question("Q1")), screen(action="finish")], quiz=FakeQuiz())
+        glides = [c for c in self.calls.mock_calls if c[0] == "glide"]
+        self.assertEqual(glides[1:5], [
+            mock.call.glide(100, 250, MONITOR),  # the answer
+            mock.call.glide(700, 600, MONITOR),  # straight on to Next, no trip to the edge
+            mock.call.glide(700, 600, MONITOR),  # the Next click starts from there
+            mock.call.glide(REST_X, 600, MONITOR, pace=1.3),  # away from whatever the new page shows there
+        ])
+
+    def test_only_the_last_of_several_answer_clicks_parks_on_next(self):
+        self.play([next_screen(question("Q1", answers=("A", "B"))), screen(action="finish")], quiz=FakeQuiz())
+        glides = [c for c in self.calls.mock_calls if c[0] == "glide"]
+        self.assertEqual(glides[1:5], [
+            mock.call.glide(100, 200, MONITOR),
+            mock.call.glide(REST_X, 200, MONITOR, pace=1.3),
+            mock.call.glide(100, 250, MONITOR),
+            mock.call.glide(700, 600, MONITOR),
+        ])
+
+    def test_the_mouse_rests_away_after_the_click_when_the_page_is_read_again_anyway(self):
+        self.play([next_screen(question("Q1")), next_screen(question("Q1", selected=["B"])), screen(action="finish")],
+                  quiz=FakeQuiz(), careful=True)
+        glides = [c for c in self.calls.mock_calls if c[0] == "glide"]
+        self.assertEqual(glides[2], mock.call.glide(REST_X, 250, MONITOR, pace=1.3))
 
     def test_scrolls_with_the_mouse_over_the_page(self):
         _, scrolls = self.play([
@@ -1606,6 +1634,12 @@ class MakeClientTest(unittest.TestCase):
             client = mcq_agent.make_client(mcq_agent.PROVIDERS["local"])
         self.assertEqual(str(client.base_url), "http://localhost:11434/v1/")
 
+    def test_a_reply_is_given_up_after_the_time_limit_and_tried_again(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "AQ.example-key"}, clear=True):
+            client = mcq_agent.make_client(mcq_agent.PROVIDERS["gemini"])
+        self.assertEqual(client.timeout, openai.Timeout(mcq_agent.REPLY_TIMEOUT, connect=mcq_agent.CONNECT_TIMEOUT))
+        self.assertEqual(client.max_retries, mcq_agent.MAX_API_RETRIES)
+
 
 class KeysFileTest(unittest.TestCase):
     def setUp(self):
@@ -1888,6 +1922,156 @@ class SecondOpinionTest(unittest.TestCase):
     def test_a_failed_call_keeps_the_first_answer_instead_of_stopping(self):
         self.assertIsNone(self.ask("", status=429))
         self.assertIsNone(self.ask("not json"))
+
+
+class PointingCheckTest(unittest.TestCase):
+    """The drawn page the model gets before the quiz, and what counts as placing its targets."""
+
+    def setUp(self):
+        self.image, self.boxes = mcq_agent.pointing_page(1920, 1080)
+
+    def grid(self, x, y):
+        return Point(x=round(x / (self.image.width - 1) * mcq_agent.GRID), y=round(y / (self.image.height - 1) * mcq_agent.GRID))
+
+    def centre(self, box):
+        left, top, right, bottom = box
+        return self.grid((left + right) / 2, (top + bottom) / 2)
+
+    def read(self, option_points, next_point):
+        options = [Option(label=label, text=text, position=point)
+                   for label, text, point in zip("ABCD", mcq_agent.POINTING_OPTIONS, option_points)]
+        q = Question(text=mcq_agent.POINTING_QUESTION, position=Point(x=400, y=220), options=options, answers=["A"],
+                     selected=[], reason="", cut_off=False)
+        return screen(q, action="next", position=next_point, label="Next", remaining="more")
+
+    def centred_read(self):
+        return self.read([self.centre(box) for _, box in self.boxes[:-1]], self.centre(self.boxes[-1][1]))
+
+    def test_the_page_has_four_option_rows_and_a_button_inside_it_in_reading_order(self):
+        self.assertEqual([name for name, _ in self.boxes], ["option A", "option B", "option C", "option D", "the Next button"])
+        for _, (left, top, right, bottom) in self.boxes:
+            self.assertTrue(0 <= left < right <= self.image.width and 0 <= top < bottom <= self.image.height)
+        for (_, above), (_, below) in zip(self.boxes, self.boxes[1:]):
+            self.assertLess(above[3], below[1])  # rows do not overlap, so a position can only be on one of them
+        self.assertEqual(self.image.size, (1920, 1080))
+
+    def test_positions_at_the_centres_of_the_targets_pass(self):
+        self.assertEqual(mcq_agent.pointing_misses(self.centred_read(), self.boxes, self.image.size), [])
+
+    def test_made_up_evenly_spaced_positions_fail_as_groqs_did(self):
+        read = self.read([Point(x=500, y=600), Point(x=500, y=650), Point(x=500, y=700), Point(x=500, y=750)], Point(x=500, y=850))
+        misses = mcq_agent.pointing_misses(read, self.boxes, self.image.size)
+        self.assertEqual(len(misses), 5)
+        self.assertRegex(misses[0], r"option A at \(\d+, \d+\) px, off its box")
+
+    def test_a_read_without_the_question_or_without_the_button_is_a_miss(self):
+        empty = screen(action="none")
+        self.assertEqual(mcq_agent.pointing_misses(empty, self.boxes, self.image.size), ["0 questions on a page with 1"])
+        no_button = self.read([self.centre(box) for _, box in self.boxes[:-1]], None)
+        self.assertEqual(mcq_agent.pointing_misses(no_button, self.boxes, self.image.size), ["the Next button nowhere"])
+
+    def check(self, *reads, monitor=SCREEN):
+        """Runs check_pointing against scripted reads; returns the printed text and the pictures' sizes."""
+        sent = []
+
+        def reading(client, provider, image):
+            sent.append(image.size)
+            return reads[min(len(sent), len(reads)) - 1]
+
+        with (
+            mock.patch.object(mcq_agent, "read_screen", side_effect=reading),
+            mock.patch.object(mcq_agent, "save_debug_image") as saved,
+            mock.patch("builtins.print") as printed,
+        ):
+            self.saved = saved
+            mcq_agent.check_pointing(None, {"model": "test-model"}, monitor)
+        return " ".join(str(c.args[0]) for c in printed.call_args_list if c.args), sent
+
+    def test_the_check_passes_on_a_good_read_and_tolerates_one_miss(self):
+        printed, sent = self.check(self.centred_read())
+        self.assertIn("Pointing check passed", printed)
+        self.assertEqual(sent, [(1920, 1080)])
+        points = [self.centre(box) for _, box in self.boxes[:-1]]
+        points[1] = Point(x=500, y=5)  # B somewhere else entirely
+        printed, _ = self.check(self.read(points, self.centre(self.boxes[-1][1])))
+        self.assertIn("passed", printed)
+        self.assertIn("with option B at", printed)
+
+    def test_two_misses_on_both_tries_stop_the_run_before_the_mouse_moves(self):
+        points = [self.centre(box) for _, box in self.boxes[:-1]]
+        points[0], points[1] = Point(x=500, y=600), Point(x=500, y=650)
+        bad = self.read(points, self.centre(self.boxes[-1][1]))
+        with self.assertRaisesRegex(AgentStop, r"test-model cannot point.*option A at.*option B at.*--no-pointing-check"):
+            self.check(bad, bad)
+        self.assertEqual(self.saved.call_args.args[2], mcq_agent.POINTING_IMAGE)
+
+    def test_a_second_try_may_pass(self):
+        points = [self.centre(box) for _, box in self.boxes[:-1]]
+        points[0], points[1] = Point(x=500, y=600), Point(x=500, y=650)
+        printed, sent = self.check(self.read(points, self.centre(self.boxes[-1][1])), self.centred_read())
+        self.assertIn("passed", printed)
+        self.assertEqual(len(sent), 2)
+
+    def test_the_page_is_drawn_at_the_size_a_screenshot_would_have(self):
+        self.assertEqual(mcq_agent.capture_size({"width": 2560, "height": 1440}), (1920, 1080))
+        self.assertEqual(mcq_agent.capture_size({"width": 1366, "height": 768}), (1366, 768))
+        _, sent = self.check(self.centred_read(), monitor={"left": 0, "top": 0, "width": 2560, "height": 1440})
+        self.assertEqual(sent, [(1920, 1080)])
+
+
+class WaitingTest(unittest.TestCase):
+    def test_a_slow_call_is_reported_every_notice_period(self):
+        with mock.patch.object(mcq_agent, "WAIT_NOTICE", 0.05), mock.patch("builtins.print") as printed:
+            with mcq_agent.Waiting("the model to read the screen"):
+                time.sleep(0.18)
+        lines = [c.args[0] for c in printed.call_args_list]
+        self.assertGreaterEqual(len(lines), 2, lines)
+        self.assertEqual(lines[0], "   Still waiting for the model to read the screen (0.05 s)...")
+        self.assertEqual(lines[1], "   Still waiting for the model to read the screen (0.1 s)...")
+
+    def test_a_quick_call_prints_nothing(self):
+        with mock.patch.object(mcq_agent, "WAIT_NOTICE", 0.2), mock.patch("builtins.print") as printed:
+            with mcq_agent.Waiting("the second opinion"):
+                pass
+        printed.assert_not_called()
+
+
+class RetryNoticeTest(unittest.TestCase):
+    RETRY = "Retrying request in %f seconds (retry %i of %s)"
+
+    def notices(self, *entries):
+        """What the agent prints when the API library logs these records."""
+        logger = logging.getLogger("openai._base_client")
+        with mock.patch.object(logger, "handlers", []), mock.patch("builtins.print") as printed:
+            mcq_agent.notice_retries()
+            mcq_agent.notice_retries()  # a second call adds nothing
+            self.assertEqual(len(logger.handlers), 1)
+            for level, message, *args in entries:
+                logger.log(level, message, *args)
+        return [c.args[0] for c in printed.call_args_list]
+
+    def test_a_rate_limit_retry_says_so_and_when(self):
+        self.assertEqual(self.notices(
+            (logging.DEBUG, "Retrying due to status code %i", 429),
+            (logging.INFO, self.RETRY, 6.6, 1, 5),
+        ), ["   The model's service did not answer (HTTP 429, its rate limit). Trying again in 7 s (1 of 5)."])
+
+    def test_a_reply_that_never_came_a_failed_connection_and_a_server_error_are_named(self):
+        self.assertEqual(self.notices(
+            (logging.DEBUG, "Encountered a timeout exception: %s", "ReadTimeout"),
+            (logging.INFO, self.RETRY, 1.4, 1, 5),
+            (logging.DEBUG, "Encountered exception: %s", "ConnectError"),
+            (logging.INFO, self.RETRY, 1.0, 2, 5),
+            (logging.DEBUG, "Retrying due to status code %i", 503),
+            (logging.INFO, self.RETRY, 2.0, 3, 5),
+        ), [
+            f"   The model's service did not answer (no reply within {mcq_agent.REPLY_TIMEOUT} s). Trying again in 1 s (1 of 5).",
+            "   The model's service did not answer (the connection failed). Trying again in 1 s (2 of 5).",
+            "   The model's service did not answer (HTTP 503, trouble on its side). Trying again in 2 s (3 of 5).",
+        ])
+
+    def test_other_library_messages_print_nothing(self):
+        self.assertEqual(self.notices((logging.DEBUG, "Request options: %s", {"method": "post"})), [])
 
 
 class PreferIpv4Test(unittest.TestCase):

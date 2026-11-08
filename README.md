@@ -2,12 +2,29 @@
 
 Reads multiple-choice questions from your screen, works out the answers with an AI model, clicks them, and moves to the next question. It works on any quiz you can see, because it reads the screen instead of the page code.
 
+## Run commands
+
+Every new PowerShell window starts in `C:\WINDOWS\system32`, where `.\run.bat` is "not recognized". Go to the folder first, or skip PowerShell: double-click the `.bat` file in File Explorer, or make a Desktop shortcut to it (right-click the file, Show more options, Create shortcut, then drag the shortcut to the Desktop).
+
+```powershell
+cd C:\mcq-agent                 # wherever you put the folder
+.\setup.bat                     # once per PC: Python, the packages and your Gemini key
+.\run.bat                       # Gemini reads the screen and clicks the answers
+.\run_fast.bat                  # the same, about half a second quicker per question
+.\run.bat --dry-run             # points at the answers without clicking: try a new site this way first
+.\run.bat --debug               # also saves every screenshot it read in reads\
+.\run.bat --careful             # reads the screen again after every answer: slower, safest
+.\run.bat --answer-provider deepseek   # a stronger model answers scenario and code questions (needs a key with credit)
+```
+
+While it runs: `Ctrl+Alt+P` pauses and resumes, `Ctrl+Alt+S` skips the question in view, `Ctrl+Alt+Q` stops, and so does moving the mouse into a screen corner. Before it starts, it checks the key, the connection and that the model can point at options (see "Before it starts").
+
 ## Choose a model
 
 | `--provider` | Who runs it | Default model | Cost | You need |
 |---|---|---|---|---|
 | `grok` (default) | xAI | `grok-4.7` | Paid: $2 per million tokens in, $6 out | Key from https://console.x.ai |
-| `groq` | Groq, hosting an open model | `qwen/qwen3.8-27b` | Has a free plan with tight limits | Key from https://console.groq.com/keys |
+| `groq` | Groq, hosting an open model | `qwen/qwen3.8-27b` | Free plan with tight limits. This model reads the words but cannot place them (checked 5 Nov 2026), so it fails the pointing check and cannot click answers | Key from https://console.groq.com/keys |
 | `local` | Your own computer, through Ollama | `gemma3:4b` | Free | Ollama from https://ollama.com/download |
 | `gemini` | Google | `gemini-3.8-flash` | Free tier with daily limits; `--model gemini-3.5-flash-lite` is much faster | Key from https://aistudio.google.com/apikey |
 | `deepseek` | DeepSeek | `deepseek-flash` | Paid: about $0.30 per million tokens in, $1.20 out | Key from https://platform.deepseek.com/api_keys |
@@ -69,6 +86,13 @@ ollama pull gemma3:4b
 - `run.bat --debug` saves every screenshot it read, with red circles on the click targets, as `reads\read-001.jpg`, `read-002.jpg` and so on. When a run goes wrong, these show what the agent saw at each step.
 - `run.bat --careful` reads the screen again after every answer before moving on, as earlier versions did. Slower, but the safest choice the first time on a new site.
 - `run_fast.bat` (or `run.bat --fast`) is the quicker variant. After its first read it sends only the columns of the screen that hold the quiz, and it asks for a shorter reply: no reason, and question and option texts cut to their first words (a command stays whole). On the 14-screen test set it got the same 14 answers right as the normal mode, with reads about 0.5 s quicker (median 2.5 s instead of 2.9 s) and half the upload. Use the normal mode when you want the reason for each answer in `answers.md`.
+- `run.bat --no-pointing-check` skips the drawn test page described next.
+
+### Before it starts
+
+During the countdown the agent opens the connection to the model's service, then sends it a drawn quiz page (one question, four options with round buttons, a Next button) and checks that the positions it returns land on those targets. A model that reads the words but cannot say where they are, as Groq's `qwen/qwen3.8-27b` does, is stopped there with a message, before the mouse moves; the page with the model's positions drawn on it is saved as `pointing-check.jpg`. One target off its box is allowed, two are not. The check is one model call, about 3 s with Gemini, inside the 10-second countdown.
+
+Waiting is never silent. A model call that takes longer than 15 s prints `Still waiting for the model to read the screen (15 s)...`, and again every 15 s. When the service turns a request down (a rate limit, trouble on its side, a dropped connection, no reply within 180 s), the agent prints why and when it will try again, up to 5 times. Connections are made over IPv4 first: some internet connections offer IPv6 that leads nowhere, and Windows would wait on it for 40 s before every new connection, which looked like the agent hanging after a click.
 
 ### While it runs: keys
 
@@ -144,7 +168,7 @@ The demo quiz shows your score after you press Submit.
 2. The model reads it and returns each question, the correct option, what is already selected, and where to click. A question whose options run below the bottom of the screen is reported as cut off.
 3. Before clicking anything, take another screenshot and compare the part of it the model read (around the questions, options and button it placed) with the first one. If that part changed in the meantime (some quizzes move on by themselves), read it again instead of clicking a page that is no longer there. Changes elsewhere, such as a scrollbar fading at the edge, are ignored.
 4. If a question is cut off, scroll so that its first line is near the top of the page and read again. Otherwise click the correct option and compare the pixels across the option's row before and after: if they changed (a radio filling, a card changing colour), the click registered, whatever the next read says about which option looks selected. A question the model reports as already selected on first sight is clicked anyway when it has one answer, because a hover highlight or a misread looks the same and clicking a chosen option again changes nothing.
-5. If every click on the page registered and nothing else on the page changed, it moves on at once with the Next, Submit or scroll the model already found, so most questions need one model call. It reads the page again first when a click could not be confirmed, when the page reacted to the click (feedback appeared), when Next has no clear label, on the last question, or always with `--careful`.
+5. If every click on the page registered and nothing else on the page changed, it moves on at once with the Next, Submit or scroll the model already found, so most questions need one model call. When that is the plan, the mouse goes from the last answer straight to that button and waits on it, instead of moving to the edge of the screen first. It reads the page again first when a click could not be confirmed, when the page reacted to the click (feedback appeared), when Next has no clear label, on the last question, or always with `--careful`.
 6. Submit the answer if the question has its own Submit button, then move on with Next. After Next or Submit it waits for the page to actually change (up to 3 seconds) and then hold still before reading it, so a slow page is not mistaken for a Next button that did nothing. If a read then shows no question at all, it waits a moment and reads again before it would scroll, because a page that reloads is blank for a moment.
 
 ## When it stops

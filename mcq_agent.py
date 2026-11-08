@@ -4,6 +4,7 @@ import base64
 import ctypes
 import io
 import json
+import logging
 import math
 import os
 import queue
@@ -25,7 +26,7 @@ if sys.platform == "win32":
 import mss
 import openai
 import pyautogui
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from pydantic import BaseModel, ValidationError, model_validator
 
 import doc_check
@@ -40,6 +41,12 @@ MAX_STUCK = 2  # reads in a row asking for the same action on the same questions
 MAX_STALE = 2  # reads in a row found out of date before acting on one anyway
 MAX_READ_TRIES = 4  # models can return bad JSON or leave a visible question unanswered
 MAX_API_RETRIES = 5  # rate limits are tight on free plans
+REPLY_TIMEOUT = 180  # s to wait for one reply before the call is given up and tried again; the library's default is 600
+CONNECT_TIMEOUT = 5  # s to open a connection, per address tried
+WAIT_NOTICE = 15  # s of waiting for a reply before, and between, lines saying so
+POINTING_TRIES = 2  # reads of the drawn test page before concluding the model cannot place what it reads
+POINTING_MISSES = 2  # of its 5 targets placed off their boxes, and the pointing check fails
+POINTING_IMAGE = "pointing-check.jpg"  # the test page with the model's positions drawn, saved when the check fails
 WAIT_SECONDS = 1.5  # before the first read: time for a hover highlight to fade once the mouse has moved away
 CLICK_SETTLE = 0.3  # after answer clicks; the move away from the option already gives the page about a second
 PAGE_SETTLE = 1.0  # after Next, Submit or a scroll, before the page is read again
@@ -51,8 +58,8 @@ CLICK_PIXELS = 12  # clearly changed pixels across a clicked option's row that s
 STILL_AFTER_CHANGE = 3  # matching screenshots in a row before a page that just changed counts as loaded
 PATCH = 60  # px across the patch compared before and after a click
 BAND = 900  # px across the strip around a clicked option that may change with it: a card shows its state along its row
-PRESS_SECONDS = (0.05, 0.2)  # range for the pause between arriving on a target and pressing
-DWELL_SECONDS = (0.2, 0.6)  # range for the pause on a target after pressing, before moving on
+PRESS_SECONDS = (0.05, 0.12)  # range for the pause between arriving on a target and pressing
+DWELL_SECONDS = (0.1, 0.25)  # range for the pause on a target after pressing, before moving on
 POINT_SECONDS = 1.0  # how long the mouse rests on each answer during a dry run
 BEND = 0.1  # how far off the straight line a move may curve, as a share of its length
 EDGE_INSET = 3  # the fallback resting spot stays at least this far in from the right edge, clear of the corners
@@ -457,7 +464,8 @@ def make_client(provider):
         if key_env == "GEMINI_API_KEY":
             raise AgentStop(f"No Gemini API key found. Run setup.bat, or put GEMINI_API_KEY=your-key in {KEYS_FILE} next to mcq_agent.py.")
         raise AgentStop(f"No API key found. Put {key_env}=your-key in {KEYS_FILE} next to mcq_agent.py.")
-    return openai.OpenAI(base_url=provider["base_url"], api_key=key, max_retries=MAX_API_RETRIES)
+    return openai.OpenAI(base_url=provider["base_url"], api_key=key, max_retries=MAX_API_RETRIES,
+                         timeout=openai.Timeout(REPLY_TIMEOUT, connect=CONNECT_TIMEOUT))
 
 
 def prefer_ipv4():
@@ -477,6 +485,71 @@ def prefer_ipv4():
 
     ipv4_first.ipv4_first_of = system
     socket.getaddrinfo = ipv4_first
+
+
+class Waiting:
+    """Says so while a model call runs longer than WAIT_NOTICE seconds, so a slow service or a dead
+    connection never looks like the agent hanging. Use: with Waiting("the model to read the screen"): ..."""
+
+    def __init__(self, what):
+        self.what = what
+        self.done = threading.Event()
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.done.set()
+        self.thread.join()
+
+    def watch(self):
+        waited = 0
+        while not self.done.wait(WAIT_NOTICE):
+            waited += WAIT_NOTICE
+            print(f"   Still waiting for {self.what} ({waited:g} s)...")
+
+
+class RetryNotice(logging.Handler):
+    """Turns the API library's retry log lines into plain messages. It otherwise waits and tries
+    again in silence, up to MAX_API_RETRIES times, which looked like a hang on a rate-limited key."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.reason = None
+
+    def emit(self, record):
+        message, args = str(record.msg), record.args or ()
+        if message.startswith("Retrying due to status code") and args:
+            self.reason = describe_status(args[0])
+        elif message.startswith("Encountered a timeout exception"):
+            self.reason = f"no reply within {REPLY_TIMEOUT} s"
+        elif message.startswith("Encountered exception"):
+            self.reason = "the connection failed"
+        elif message.startswith("Retrying request in") and len(args) == 3:
+            seconds, attempt, total = args
+            print(f"   The model's service did not answer ({self.reason or 'unknown reason'}). "
+                  f"Trying again in {float(seconds):.0f} s ({attempt} of {total}).")
+            self.reason = None
+
+
+def describe_status(code):
+    code = int(code)
+    if code == 429:
+        return "HTTP 429, its rate limit"
+    if code >= 500:
+        return f"HTTP {code}, trouble on its side"
+    return f"HTTP {code}"
+
+
+def notice_retries():
+    """Have the API library's retries reported on the screen; once per process."""
+    logger = logging.getLogger("openai._base_client")
+    if any(isinstance(handler, RetryNotice) for handler in logger.handlers):
+        return
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(RetryNotice())
 
 
 def with_effort(provider, level):
@@ -598,13 +671,17 @@ def rest_and_settle(monitor):
     time.sleep(WAIT_SECONDS)
 
 
-def click(point, monitor, blank=None):
+def click(point, monitor, blank=None, park=None):
+    """Move to the point, click it, then rest away from it, or park on the control given, ready for the next click."""
     x, y = to_screen(point, monitor)
     glide(x, y, monitor)
     time.sleep(wobble.uniform(*PRESS_SECONDS))
     pyautogui.click(x, y)
     time.sleep(wobble.uniform(*DWELL_SECONDS))
-    rest(monitor, y, blank)
+    if park is not None:
+        glide(*to_screen(park, monitor), monitor)
+    else:
+        rest(monitor, y, blank)
 
 
 CLEAR = [0] * 25 + [255] * 231  # brightness differences above 24 count as a change
@@ -938,18 +1015,19 @@ def read_screen(client, provider, image):
     problem = "no reply"
     for _ in range(MAX_READ_TRIES):
         started = time.perf_counter()
-        response = client.chat.completions.create(
-            model=provider["model"],
-            response_format=response_format,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": image_url},
-                    {"type": "text", "text": "Read this screenshot."},
-                ]},
-            ],
-            **extra,
-        )
+        with Waiting("the model to read the screen"):
+            response = client.chat.completions.create(
+                model=provider["model"],
+                response_format=response_format,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": image_url},
+                        {"type": "text", "text": "Read this screenshot."},
+                    ]},
+                ],
+                **extra,
+            )
         print(f"   Model: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
         choice = response.choices[0]
         if choice.message.refusal:
@@ -975,15 +1053,16 @@ def ask_text(client, provider, prompt, lines, question, what):
     extra = request_extras(provider)
     try:
         started = time.perf_counter()
-        response = client.chat.completions.create(
-            model=provider["model"],
-            response_format=reply_format(provider, {
-                "type": "json_schema",
-                "json_schema": {"name": "text_answer", "schema": SECOND_OPINION_SCHEMA, "strict": True},
-            }),
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": "\n".join(lines)}],
-            **extra,
-        )
+        with Waiting(f"the {what}"):
+            response = client.chat.completions.create(
+                model=provider["model"],
+                response_format=reply_format(provider, {
+                    "type": "json_schema",
+                    "json_schema": {"name": "text_answer", "schema": SECOND_OPINION_SCHEMA, "strict": True},
+                }),
+                messages=[{"role": "system", "content": prompt}, {"role": "user", "content": "\n".join(lines)}],
+                **extra,
+            )
         print(f"   Model, {what}: {time.perf_counter() - started:.1f} s, {describe_usage(response.usage)}")
         reply = SecondOpinion.model_validate_json(response.choices[0].message.content or "")
     except (openai.APIError, ValidationError, IndexError) as e:
@@ -1377,6 +1456,102 @@ def save_debug_image(image, read, path=None, view=None):
     marked.save(path or DEBUG_IMAGE, quality=90)
 
 
+POINTING_QUESTION = "Which Git command shows the commit history of the current branch?"
+POINTING_OPTIONS = ["git log", "git status", "git diff", "git push"]
+
+
+def capture_size(monitor):
+    """The size of a screenshot of this monitor once capture() has downscaled it."""
+    scale = min(1.0, MAX_LONG_EDGE / max(monitor["width"], monitor["height"]))
+    return round(monitor["width"] * scale), round(monitor["height"] * scale)
+
+
+def pointing_font(size):
+    """A readable font at this pixel size: Arial where Windows has it, Pillow's own otherwise."""
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except OSError:
+        return ImageFont.load_default(size)
+
+
+def pointing_page(width, height):
+    """A quiz page drawn for the pointing check, and the pixel boxes of its targets.
+
+    One question, four options with round buttons and a Next button, laid out like a plain quiz
+    site. Returns the image and a list of (name, box): a box for each option's row, from its
+    button to the end of its words, and one around the Next button.
+    """
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    header = round(height * 0.07)
+    draw.rectangle((0, 0, width, header), fill=(240, 242, 245))
+    small, body, big = (pointing_font(round(height * share)) for share in (0.022, 0.026, 0.03))
+    left = round(width * 0.18)
+    draw.text((left, round(header * 0.3)), "Practice quiz    Question 3 of 10", fill=(60, 60, 60), font=small)
+    draw.text((left, round(height * 0.2)), POINTING_QUESTION, fill=(20, 20, 20), font=big)
+    boxes = []
+    radius, spacing, top = round(height * 0.011), round(height * 0.09), round(height * 0.36)
+    for index, text in enumerate(POINTING_OPTIONS):
+        label = "ABCD"[index]
+        cx, cy = left + radius, top + index * spacing
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), outline=(90, 90, 90), width=2)
+        words = f"{label}. {text}"
+        x = cx + 3 * radius
+        draw.text((x, cy), words, fill=(20, 20, 20), font=body, anchor="lm")
+        right = draw.textbbox((x, cy), words, font=body, anchor="lm")[2]
+        boxes.append((f"option {label}", (cx - 2 * radius, cy - round(spacing * 0.45), right + 2 * radius, cy + round(spacing * 0.45))))
+    button_top = top + len(POINTING_OPTIONS) * spacing
+    button = (left, button_top, left + round(width * 0.08), button_top + round(height * 0.05))
+    draw.rounded_rectangle(button, radius=6, fill=(37, 99, 235))
+    draw.text(((button[0] + button[2]) / 2, (button[1] + button[3]) / 2), "Next", fill="white", font=body, anchor="mm")
+    pad = round(height * 0.02)
+    boxes.append(("the Next button", (button[0] - pad, button[1] - pad, button[2] + pad, button[3] + pad)))
+    return image, boxes
+
+
+def pointing_misses(read, boxes, size):
+    """The targets of the drawn page that the read placed off their boxes, by name, or what else is wrong with it."""
+    if len(read.questions) != 1:
+        return [f"{len(read.questions)} questions on a page with 1"]
+    width, height = size
+    options = read.questions[0].options
+    targets = [(name, box, options[index].position if index < len(options) else None)
+               for index, (name, box) in enumerate(boxes[:-1])]
+    targets.append((boxes[-1][0], boxes[-1][1], read.navigation.position))
+    misses = []
+    for name, (left, top, right, bottom), point in targets:
+        if point is None:
+            misses.append(f"{name} nowhere")
+            continue
+        x, y = point.x / GRID * (width - 1), point.y / GRID * (height - 1)
+        if not (left <= x <= right and top <= y <= bottom):
+            misses.append(f"{name} at ({x:.0f}, {y:.0f}) px, off its box")
+    return misses
+
+
+def check_pointing(client, provider, monitor):
+    """One read of a drawn quiz page before the quiz: a model that reads the words but cannot say
+    where they are would click beside every option, so it is stopped before the mouse moves.
+
+    Groq's qwen/qwen3.8-27b did exactly that on 2026-11-05: evenly spaced made-up positions, 0 of
+    8 options hit on generated pages, and the only sign in a run was a click that never registered.
+    """
+    image, boxes = pointing_page(*capture_size(monitor))
+    print("Pointing check: a drawn test page goes to the model first, to see that it can place what it reads.")
+    started = time.monotonic()
+    for _ in range(POINTING_TRIES):
+        read = read_screen(client, provider, image)
+        misses = pointing_misses(read, boxes, image.size)
+        if len(misses) < POINTING_MISSES:
+            print(f"   Pointing check passed in {time.monotonic() - started:.1f} s" + (f", with {misses[0]}." if misses else "."))
+            return
+    save_debug_image(image, read, POINTING_IMAGE)
+    raise AgentStop(f"{provider['model']} cannot point at things on the screen: on the test page it put "
+                    f"{', '.join(misses)}. It reads the words but not where they are, so its clicks would miss. "
+                    f"Use a model that gives positions, such as the gemini provider's (run.bat), or add "
+                    f"--no-pointing-check to go ahead anyway. The page and its guesses are in {POINTING_IMAGE}.")
+
+
 def dry_run(client, provider, sct, monitor):
     rest_and_settle(monitor)
     image = capture(sct, monitor)
@@ -1552,6 +1727,12 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
         keys = {key_of(q, decided, done) for q in read.questions if not q.cut_off}
         if any(attempts[key] for key in keys - {key_of(q, decided, done) for q, _ in pending} - given_up):
             failed = 0  # a click made earlier shows as registered now
+        # When this read's Next or Submit can be followed right after confirmed clicks, the mouse parks
+        # on it after the last answer click instead of resting at the edge: one move fewer per question.
+        park = navigation.position if (not careful and intended_action(navigation) in ("next", "submit")
+                                       and reusable(read)) else None
+        planned = sum(len(options) for question, options in pending
+                      if attempts[key_of(question, decided, done)] < MAX_ATTEMPTS)
         clicked = []
         gave_up = False
         for question, options in pending:
@@ -1572,7 +1753,8 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
                 # The whole row is watched: the radio or tick that reacts may sit beside the words the model pointed at.
                 strip = band_box(fresh, option.position, monitor) if fresh is not None else None
                 clicked.append((key, option, strip, fresh.crop(strip) if strip else None))
-                click(option.position, monitor, blank)
+                planned -= 1
+                click(option.position, monitor, blank, park if planned == 0 else None)
             if attempts[key] == 0:
                 answered += 1
             attempts[key] += 1
@@ -1755,11 +1937,14 @@ def main():
                         help="how much the answer model thinks, in its host's words (often low, medium or high)")
     parser.add_argument("--answer-all", action="store_true",
                         help="send every question to the answer model, not only scenario and code questions")
+    parser.add_argument("--no-pointing-check", action="store_true",
+                        help="skip the drawn test page sent before the quiz to see that the model can place what it reads")
     parser.add_argument("--save-key", metavar="KEY", help=f"save this API key for the chosen provider in {KEYS_FILE} and exit")
     parser.add_argument("--check-key", action="store_true",
                         help="say where the chosen provider's key comes from and exit; exit code 1 when there is none")
     args = parser.parse_args()
     prefer_ipv4()
+    notice_retries()
 
     provider = dict(PROVIDERS[args.provider])
     if args.model:
@@ -1807,16 +1992,18 @@ def main():
                 log = AnswerLog(path, provider["model"], args.fast)
                 print(f"Answers are written to {ANSWERS_FILE}.")
         started = time.monotonic()
-        warm_up(client, provider)
-        if answerer:
-            warm_up(answerer["client"], answerer["provider"])  # a bad key for it stops the run here, not mid-quiz
-            try_answerer(answerer)
-        time.sleep(max(0.0, args.delay - (time.monotonic() - started)))
         with mss.MSS() as sct:
             # The abort corners are the primary monitor's, so that is the one to work on.
             monitor = next((m for m in sct.monitors[1:] if m.get("is_primary")), sct.monitors[1])
             if len(sct.monitors) > 2:
                 print(f"Reading the main monitor only ({monitor['width']}x{monitor['height']}). Keep the quiz on it.")
+            warm_up(client, provider)
+            if answerer:
+                warm_up(answerer["client"], answerer["provider"])  # a bad key for it stops the run here, not mid-quiz
+                try_answerer(answerer)
+            if not args.no_pointing_check:
+                check_pointing(client, provider, monitor)  # within the countdown as well: one read
+            time.sleep(max(0.0, args.delay - (time.monotonic() - started)))
             if args.dry_run:
                 dry_run(client, provider, sct, monitor)
             else:
@@ -1836,6 +2023,9 @@ def main():
         # Gemini wraps some error bodies in a list, which the SDK leaves out of the message.
         detail = f" {e.body}" if isinstance(e.body, list) else ""
         sys.exit(f"API error ({e.status_code}): {e.message}{detail}")
+    except openai.APITimeoutError:
+        sys.exit(f"\nThe model's service at {provider['base_url']} did not answer within {REPLY_TIMEOUT} s, "
+                 f"{MAX_API_RETRIES + 1} times in a row. Check the connection and run again.")
     except openai.APIConnectionError:
         sys.exit(f"Could not reach {provider['base_url']}. {hint}")
     finally:
