@@ -98,6 +98,7 @@ HOTKEYS = {  # what each key does, its name, and its Windows modifiers and virtu
     "pause": ("Ctrl+Alt+P", MOD_CONTROL | MOD_ALT, ord("P")),
     "skip": ("Ctrl+Alt+S", MOD_CONTROL | MOD_ALT, ord("S")),
     "stop": ("Ctrl+Alt+Q", MOD_CONTROL | MOD_ALT, ord("Q")),
+    "stop_esc": ("Esc", 0, 0x1B),  # a single easy-to-hit stop; grabs Esc only while the agent runs
 }
 # Button labels, in several languages, that end or grade the whole quiz rather than one question.
 ENDS_QUIZ = re.compile(
@@ -1376,7 +1377,7 @@ class Controls:
         ready = threading.Event()
         threading.Thread(target=self._listen, args=(ready,), daemon=True).start()
         ready.wait(2)
-        uses = {"pause": "pauses and goes on", "skip": "skips the question in view", "stop": "stops"}
+        uses = {"pause": "pauses and goes on", "skip": "skips the question in view", "stop": "stops", "stop_esc": "also stops"}
         working = [f"{HOTKEYS[name][0]} {uses[name]}" for name in HOTKEYS if name not in self.taken]
         line = f"Keys: {', '.join(working)}." if working else "No keys could be registered."
         if self.taken:
@@ -1422,7 +1423,7 @@ def attend(controls, monitor):
             pending = controls.take()
             continue
         event = pending.pop(0)
-        if event == "stop":
+        if event in ("stop", "stop_esc"):
             return "stop"
         if event == "skip":
             outcome = "skip"
@@ -1625,6 +1626,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
     pending_fit = None  # the cut-off question just scrolled for, until it is seen again
     page_scrolled = 0  # px scrolled down on this page since the last Next or Submit
     rewound = False  # whether that scrolling was undone once, for a question it had passed
+    returned_to_top = False  # whether we scrolled back to the top once to re-find the quiz
     submitted = set()
     left = set()  # questions already moved past with Next
     answered = 0
@@ -1816,6 +1818,12 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
         stuck = stuck + 1 if same_state(state, last_state) or revisited else 0
         last_state = state
         if stuck >= MAX_STUCK:
+            if page_scrolled > 0 and not returned_to_top:
+                print("\nI scrolled down without finding the quiz, so I'm going back to the top to look.")
+                scroll_page(sct, monitor, -(page_scrolled + monitor["height"]))
+                page_scrolled, returned_to_top = 0, True
+                stuck, last_state = 0, None
+                continue
             print("\nThe screen stopped changing, so I'm stopping here.")
             if not decided:
                 print("No question was found on the main monitor. If the quiz is on another screen, move it to the main one.")
@@ -1870,7 +1878,7 @@ def run(client, provider, sct, monitor, max_steps, debug=False, careful=False, l
             time.sleep(PAGE_SETTLE)
         else:
             wait_for_change(sct, monitor, fresh, read_region(read, fresh))
-        page_scrolled, rewound = 0, False
+        page_scrolled, rewound, returned_to_top = 0, False, False
     else:
         print(f"\nStopped after {max_steps} steps.")
 
